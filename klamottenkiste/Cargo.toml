@@ -1,0 +1,21 @@
+[package]
+name = "klamottenkiste"
+version = "0.1.0"
+description = "Embed a Wayland application inside a GTK4 widget, via a nested Smithay compositor"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nested-wayland-session = { path = "../vendor/nested-wayland-session", package = "monochromatic-nested-wayland-session" }
+gtk.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+libadwaita.workspace = true
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
