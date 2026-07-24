@@ -151,7 +151,7 @@ pub mod state;
 /// ```ts
 /// export { run, spawn_headless, HeadlessHandle } from "./app";
 /// ```
-pub use app::{run, spawn_headless, Frame, HeadlessHandle};
+pub use app::{run, spawn_headless, DmabufFrame, DmabufPlane, Frame, HeadlessHandle};
 
 /// What:     `pub use cli::{parse_args, Config};`. Re-export the parser and its output.
 /// Why:      The binary and tests use these directly from the crate root.

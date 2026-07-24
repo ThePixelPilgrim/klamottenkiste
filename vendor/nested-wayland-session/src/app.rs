@@ -90,6 +90,53 @@ pub struct Frame {
     pub stride: usize,
 }
 
+/// One plane of a dmabuf-backed render target, described in plain POD terms.
+///
+/// What:     `pub struct DmabufPlane { pub fd: RawFd, pub offset: u32, pub stride: u32 }`.
+///           `fd` is a BORROWED raw file descriptor: the compositor keeps the owning
+///           `Dmabuf` alive (the slot stays `in_flight`) for as long as the consumer
+///           holds the matching `DmabufFrame`, so the number is valid until the consumer
+///           releases the slot. The importer must `dup` it if it needs to outlive that.
+/// Why:      Hands the GTK side exactly what `zwp_linux_dmabuf`/`gdk::DmabufTextureBuilder`
+///           want (fd + offset + stride per plane) without any smithay type crossing the
+///           crate boundary.
+#[derive(Clone)]
+pub struct DmabufPlane {
+    /// Borrowed DRM-prime file descriptor for this plane (owned by the compositor's slot).
+    pub fd: std::os::fd::RawFd,
+    /// Byte offset of this plane within its fd.
+    pub offset: u32,
+    /// Row stride in bytes for this plane.
+    pub stride: u32,
+}
+
+/// A handle to the compositor's current dmabuf-backed render target, for zero-copy import.
+///
+/// What:     `pub struct DmabufFrame { width, height, fourcc: u32, modifier: u64, planes:
+///           Vec<DmabufPlane>, buffer_id: u64 }`. A plain owned description (no smithay
+///           types) of the pool slot the last frame was composited into. `fourcc` is the
+///           DRM FourCC as a raw `u32`; `modifier` the DRM modifier as a raw `u64`.
+///           `buffer_id` identifies the pool slot so the consumer can release it via
+///           [`HeadlessHandle::release_dmabuf`] once it has finished sampling.
+/// Why:      The GTK host imports this as a `GdkDmabufTexture` (zero-copy) instead of the
+///           CPU readback the `Frame` path does. A slot handed out here is NOT reused for
+///           rendering until it is released, so its planes stay stable while sampled.
+#[derive(Clone)]
+pub struct DmabufFrame {
+    /// Target width in pixels.
+    pub width: u32,
+    /// Target height in pixels.
+    pub height: u32,
+    /// DRM FourCC of the target (e.g. `DRM_FORMAT_ARGB8888`) as a raw `u32`.
+    pub fourcc: u32,
+    /// DRM format modifier as a raw `u64`.
+    pub modifier: u64,
+    /// One entry per plane (fd/offset/stride).
+    pub planes: Vec<DmabufPlane>,
+    /// Opaque pool-slot id, echoed back to `release_dmabuf` when sampling is done.
+    pub buffer_id: u64,
+}
+
 /// Target frame interval for the redraw timer (~60 Hz).
 ///
 /// What:     `const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);`.
@@ -107,22 +154,30 @@ const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 pub fn register_redraw_timer(loop_handle: &LoopHandle<'static, Compositor>) {
     loop_handle
         .insert_source(Timer::immediate(), |_, _, state: &mut Compositor| {
-            // What:     `redraw(state);`. Composite one frame and send frame callbacks.
+            // What:     `redraw(state);`. Composite one frame and send frame callbacks. In
+            //           `dmabuf` present mode `redraw` also finishes the GPU work, exports the
+            //           slot's dmabuf, and publishes it into `state.latest_dmabuf` — no CPU
+            //           readback happens on this path at all.
             // Why:      The per-tick render work (submit + frame callbacks keep clients drawing).
             redraw(state);
 
-            // What:     Read the composited frame back and publish it to the shared slot.
-            // Why:      The GTK host thread pulls the latest frame from here to present it.
-            //           This runs on the compositor thread, where the GLES context is
+            // What:     Only in `readback` present mode: read the composited frame back to CPU
+            //           memory and publish it to `latest_frame`. In `dmabuf` mode this whole
+            //           block is skipped — the `glReadPixels` roundtrip is exactly the cost the
+            //           dmabuf path removes.
+            // Why:      The GTK host pulls whichever slot matches the active present mode. This
+            //           readback runs on the compositor thread, where the GLES context is
             //           current — the only place `read_frame_rgba` may be called.
-            let (bytes, width, height, stride) = read_frame_rgba(state);
-            if let Ok(mut slot) = state.latest_frame.lock() {
-                *slot = Some(Frame {
-                    bytes,
-                    width,
-                    height,
-                    stride,
-                });
+            if state.backend.present_mode() == crate::backend::PresentMode::Readback {
+                let (bytes, width, height, stride) = read_frame_rgba(state);
+                if let Ok(mut slot) = state.latest_frame.lock() {
+                    *slot = Some(Frame {
+                        bytes,
+                        width,
+                        height,
+                        stride,
+                    });
+                }
             }
 
             // What:     `TimeoutAction::ToDuration(FRAME_INTERVAL)`. Reschedule the timer.
@@ -234,8 +289,12 @@ pub fn run(config: Config) -> Result<i32> {
 pub struct HeadlessHandle {
     /// The advertised `WAYLAND_DISPLAY` socket name (e.g. `wayland-1`).
     socket_name: String,
-    /// The latest composited frame the compositor thread published, if any.
+    /// The latest composited frame the compositor thread published, if any (readback path).
     latest_frame: Arc<Mutex<Option<Frame>>>,
+    /// The latest dmabuf-backed target the compositor thread published, if any (dmabuf path).
+    latest_dmabuf: Arc<Mutex<Option<DmabufFrame>>>,
+    /// Signals a pool slot is done being sampled and may be reused for rendering.
+    release_tx: Sender<u64>,
     /// A clone of the real-GTK-input sender: enqueue `SpikeInput` for the seat.
     input_tx: Sender<SpikeInput>,
     /// The bound control-socket path (for the `type`/`click`/`screenshot` API), if any.
@@ -270,6 +329,43 @@ impl HeadlessHandle {
     ///           clone hands GTK an owned buffer without holding the compositor's lock.
     pub fn latest_frame(&self) -> Option<Frame> {
         self.latest_frame.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Take a snapshot of the most recently composited dmabuf-backed target, if any.
+    ///
+    /// What:     `pub fn latest_dmabuf(&self) -> Option<DmabufFrame>`. Clones out the plain
+    ///           `DmabufFrame` (fds are borrowed — the compositor keeps the underlying
+    ///           `Dmabuf` alive until the matching slot is released). `None` before the
+    ///           first dmabuf frame, or when the compositor is in `readback` present mode.
+    /// Why:      The GTK host imports this as a `GdkDmabufTexture` (zero-copy) instead of the
+    ///           CPU readback `latest_frame` does. After sampling, the host MUST call
+    ///           [`HeadlessHandle::release_dmabuf`] with `frame.buffer_id` so the slot can be
+    ///           reused; until then the render loop will not overwrite it.
+    pub fn latest_dmabuf(&self) -> Option<DmabufFrame> {
+        self.latest_dmabuf.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Signal that a dmabuf pool slot has been fully sampled and may be reused.
+    ///
+    /// What:     `pub fn release_dmabuf(&self, buffer_id: u64)`. Sends the slot id back to
+    ///           the compositor thread over a channel; the render loop drains it before the
+    ///           next `bind` and returns that slot to the free pool. Sending after the
+    ///           compositor has shut down is a harmless no-op.
+    /// Why:      A slot handed out via `latest_dmabuf` is NOT reused for rendering until it
+    ///           is released, so the consumer's import stays valid while it samples. This is
+    ///           the release half of that contract.
+    pub fn release_dmabuf(&self, buffer_id: u64) {
+        let _ = self.release_tx.send(buffer_id);
+    }
+
+    /// A clone of the sender the consumer uses to release sampled dmabuf slots.
+    ///
+    /// What:     `pub fn release_sender(&self) -> Sender<u64>`. Cheap clone of the crossbeam
+    ///           sending half, for callers that prefer to hold the channel directly.
+    /// Why:      Mirrors `input_sender`: lets a host wire the release signal into its own
+    ///           frame-callback plumbing without going through `&self` each time.
+    pub fn release_sender(&self) -> Sender<u64> {
+        self.release_tx.clone()
     }
 
     /// A clone of the sender for enqueuing real GTK input into the compositor seat.
@@ -376,8 +472,12 @@ impl Drop for HeadlessHandle {
 struct Ready {
     /// The advertised `WAYLAND_DISPLAY` socket name.
     socket_name: String,
-    /// The shared slot the redraw timer publishes frames into.
+    /// The shared slot the redraw timer publishes readback frames into.
     latest_frame: Arc<Mutex<Option<Frame>>>,
+    /// The shared slot the redraw timer publishes dmabuf frames into.
+    latest_dmabuf: Arc<Mutex<Option<DmabufFrame>>>,
+    /// The sending half of the dmabuf slot-release channel.
+    release_tx: Sender<u64>,
     /// The sending half of the real-GTK-input queue.
     input_tx: Sender<SpikeInput>,
     /// SPIKE SCOPE: text the hosted client copied.
@@ -471,6 +571,8 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
             let ready = Ready {
                 socket_name: state.socket_name.to_string_lossy().into_owned(),
                 latest_frame: Arc::clone(&state.latest_frame),
+                latest_dmabuf: Arc::clone(&state.latest_dmabuf),
+                release_tx: state.backend.release_sender(),
                 input_tx: state.input_tx.clone(),
                 // SPIKE SCOPE: the two halves the GTK host needs to bridge clipboards.
                 clipboard_from_nested: state.clipboard.to_host_rx.clone(),
@@ -506,6 +608,8 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
         Ok(Ok(ready)) => Ok(HeadlessHandle {
             socket_name: ready.socket_name,
             latest_frame: ready.latest_frame,
+            latest_dmabuf: ready.latest_dmabuf,
+            release_tx: ready.release_tx,
             input_tx: ready.input_tx,
             control_socket_path: Some(control_socket_path),
             clipboard_from_nested: ready.clipboard_from_nested,

@@ -69,6 +69,17 @@ fn control_request(path: &Path, line: &str) -> Result<String, String> {
 
 #[test]
 fn teardown_releases_and_state_survives_pump_pause() {
+    // This test probes the compositor's liveness through the CPU-readback frame pump
+    // (`latest_frame`), so pin the backend to the `readback` present mode. The default
+    // present mode is now `dmabuf`, which publishes `latest_dmabuf` instead and leaves
+    // `latest_frame` empty; the dmabuf path has its own headless verification. Setting the
+    // env before any `spawn_headless` is safe here — this integration binary runs exactly
+    // one test, so there is no concurrent reader of the variable.
+    // SAFETY: single-threaded at this point (no compositor thread spawned yet).
+    unsafe {
+        std::env::set_var("KLAMOTTENKISTE_PRESENT", "readback");
+    }
+
     // ---- (a) TEARDOWN: spawn + shutdown N times; assert clean release each time. --------
     let fd_baseline = open_fd_count();
 

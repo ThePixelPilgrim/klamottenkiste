@@ -252,6 +252,17 @@ pub struct Compositor {
     ///           latest frame is kept — a slow consumer simply skips intermediate frames.
     pub latest_frame: Arc<Mutex<Option<crate::app::Frame>>>,
 
+    /// The most recently composited dmabuf-backed target, published for zero-copy import.
+    ///
+    /// What:     `pub latest_dmabuf: Arc<Mutex<Option<crate::app::DmabufFrame>>>`. A
+    ///           thread-safe slot holding the plain description (fds/offsets/strides/format)
+    ///           of the pool slot the last frame was composited into, or `None` before the
+    ///           first dmabuf frame (or in `readback` present mode).
+    /// Why:      In `dmabuf` present mode the redraw timer publishes here instead of
+    ///           `latest_frame`; the GTK host reads it via `HeadlessHandle::latest_dmabuf`
+    ///           and imports it as a `GdkDmabufTexture` with no CPU readback.
+    pub latest_dmabuf: Arc<Mutex<Option<crate::app::DmabufFrame>>>,
+
     /// Sending half of the real-GTK-input queue.
     ///
     /// What:     `pub input_tx: Sender<SpikeInput>`. The clone handed to the GTK host so
@@ -503,6 +514,7 @@ impl Compositor {
             loop_handle,
             pending_dnd_uri_list: None,
             latest_frame: Arc::new(Mutex::new(None)),
+            latest_dmabuf: Arc::new(Mutex::new(None)),
             input_tx,
             input_rx,
             clipboard: crate::clipboard::ClipboardBridge::new(),

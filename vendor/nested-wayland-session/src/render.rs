@@ -226,6 +226,18 @@ pub fn redraw(state: &mut Compositor) {
         .unwrap();
     }
 
+    // What:     In `dmabuf` present mode, finish the GPU work for the slot just composited,
+    //           export its plain dmabuf description, and publish it into `latest_dmabuf` for
+    //           the GTK host to import zero-copy. In `readback` mode `export_current` returns
+    //           `None` and this is a no-op (the timer does the CPU readback instead).
+    // Why:      This is the whole point of phase A: hand out a dmabuf-backed target that was
+    //           composited with `render_output` (toplevel + ALL popups), with no glReadPixels.
+    if let Some(frame) = state.backend.export_current() {
+        if let Ok(mut slot) = state.latest_dmabuf.lock() {
+            *slot = Some(frame);
+        }
+    }
+
     // What:     `state.backend.submit(Some(&[damage])).unwrap();`. Presents the frame,
     //           telling the parent which region changed. `Some(&[damage])` is a
     //           one-element slice of the whole-framebuffer rectangle. `.unwrap()` panics
