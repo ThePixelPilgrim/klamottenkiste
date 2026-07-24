@@ -25,10 +25,18 @@
 
 #![deny(missing_docs)]
 
+mod widget;
+
+/// The reusable GTK4 widget: drop a hosted Wayland app into any layout.
+///
+/// See [`widget`] (its module docs) for the two-lifecycle model — map/visibility vs. object
+/// lifetime — and the embedder contract for hiding a pane without killing its browser.
+pub use widget::WaylandPane;
+
 /// Re-export of the vendored nested compositor.
 ///
-/// Exposed while the widget API is still being shaped: the demo and the embedder currently
-/// reach through to `spawn_headless`, the control socket, and the input types directly. As the
-/// widget API firms up, the surface here should shrink to whatever the widget genuinely needs
-/// to hand back to callers.
+/// The widget builds on this internally; it stays public because an embedder still needs the
+/// input event type ([`compositor::input::SpikeInput`]) to drive a pane's
+/// [`WaylandPane::input_sender`], and the multi-instance gate example drives `spawn_headless`
+/// and the control socket directly.
 pub use nested_wayland_session as compositor;

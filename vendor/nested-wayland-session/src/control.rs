@@ -18,8 +18,13 @@
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::Path,
-    sync::mpsc::{sync_channel, SyncSender},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{sync_channel, SyncSender},
+        Arc,
+    },
+    thread::JoinHandle,
 };
 
 /// What:     Grouped `use` of the calloop channel (cross-thread source) and loop handle.
@@ -74,21 +79,64 @@ pub struct ControlRequest {
     pub reply: SyncSender<Response>,
 }
 
+/// A joinable handle to the running control thread and its socket file.
+///
+/// What:     `pub struct ControlHandle { thread: JoinHandle<()>, stop: Arc<AtomicBool>,
+///           path: PathBuf }`. Owns the control thread's join handle, a shared stop flag,
+///           and the bound socket path.
+/// Why:      An embedding host must be able to tear the control API down deterministically
+///           (join the thread, unlink the socket file) rather than leaking a thread blocked
+///           forever on `accept`. `shutdown` performs exactly that.
+pub struct ControlHandle {
+    /// The control thread's join handle.
+    thread: JoinHandle<()>,
+    /// Shared flag the accept loop checks; set by `shutdown` to make the loop exit.
+    stop: Arc<AtomicBool>,
+    /// The bound socket path, unlinked on `shutdown`.
+    path: PathBuf,
+}
+
+impl ControlHandle {
+    /// Stop the control thread, join it, and unlink the socket file.
+    ///
+    /// What:     `pub fn shutdown(self)`. Sets the stop flag, self-connects once to wake the
+    ///           blocking `accept`, joins the thread, then removes the socket file.
+    /// Why:      `UnixListener::incoming()` blocks in `accept`; setting a flag alone never
+    ///           unblocks it. A throwaway self-connection makes `accept` return so the loop
+    ///           observes the flag and exits, leaving no orphaned thread or fd behind.
+    pub fn shutdown(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Wake the blocking `accept`: connect once so it returns and the loop re-checks
+        // the flag. The connection is closed immediately (dropped); the thread breaks
+        // before ever reading from it.
+        let _ = UnixStream::connect(&self.path);
+        let _ = self.thread.join();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Bind the control socket, register the channel source, and spawn the control thread.
 ///
 /// What:     `pub fn start(loop_handle: &LoopHandle<Compositor>, socket_path: &Path) ->
-///           Result<()>`. Borrows the loop handle (to insert the channel source) and the
-///           socket path. The loop-handle lifetime is elided, matching `child.rs`.
-/// Why:      One call from `run` wires the whole control API when a socket is requested.
+///           Result<ControlHandle>`. Borrows the loop handle (to insert the channel source)
+///           and the socket path. Returns a [`ControlHandle`] the caller can `shutdown`.
+/// Why:      One call from `run`/`spawn_headless` wires the whole control API when a socket
+///           is requested; the returned handle lets a host tear it down deterministically.
 ///
 /// In TS you'd write (pseudocode):
 /// ```ts
-/// function start(loopHandle, socketPath): void { ... }
+/// function start(loopHandle, socketPath): ControlHandle { ... }
 /// ```
-pub fn start(loop_handle: &LoopHandle<Compositor>, socket_path: &Path) -> Result<()> {
+pub fn start(loop_handle: &LoopHandle<Compositor>, socket_path: &Path) -> Result<ControlHandle> {
     // What:     `let listener = bind_listener(socket_path)?;`. Create the listening socket.
     // Why:      The control thread accepts connections on it.
     let listener = bind_listener(socket_path)?;
+
+    // What:     A shared stop flag the accept loop consults after each accepted connection.
+    // Why:      `shutdown` sets it (and self-connects to wake `accept`) so the thread exits
+    //           instead of leaking.
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
 
     // What:     `let (sender, channel) = channel::<ControlRequest>();`. Create a calloop
     //           cross-thread channel: `sender` (moved to the control thread) and `channel`
@@ -120,17 +168,21 @@ pub fn start(loop_handle: &LoopHandle<Compositor>, socket_path: &Path) -> Result
         .map_err(|err| anyhow::anyhow!("registering the control channel source failed: {err}"))?;
 
     // What:     `std::thread::Builder::new().name("nws-control".to_string()).spawn(move ||
-    //           control_thread(listener, sender)).context(...)?;`. Spawn the named control
-    //           thread, moving the listener and sender into it.
+    //           control_thread(listener, sender, thread_stop)).context(...)?;`. Spawn the
+    //           named control thread, moving the listener, sender, and stop flag into it.
     // Why:      Keep blocking socket I/O off the event-loop thread.
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("nws-control".to_string())
-        .spawn(move || control_thread(listener, sender))
+        .spawn(move || control_thread(listener, sender, thread_stop))
         .context("spawning the control thread")?;
 
-    // What:     `Ok(())`. Success.
-    // Why:      Signal the control API is up.
-    Ok(())
+    // What:     `Ok(ControlHandle { .. })`. Return the joinable handle.
+    // Why:      Let the caller (`spawn_headless`) tear the control API down on shutdown.
+    Ok(ControlHandle {
+        thread,
+        stop,
+        path: socket_path.to_path_buf(),
+    })
 }
 
 /// Bind (and clean up any stale) the control Unix socket.
@@ -164,15 +216,23 @@ fn bind_listener(path: &Path) -> Result<UnixListener> {
 
 /// The control thread body: accept connections and handle each in turn.
 ///
-/// What:     `fn control_thread(listener: UnixListener, sender: Sender<ControlRequest>)`.
-///           Owns the listener and the channel sender.
+/// What:     `fn control_thread(listener: UnixListener, sender: Sender<ControlRequest>,
+///           stop: Arc<AtomicBool>)`. Owns the listener and the channel sender; consults
+///           the shared `stop` flag to exit cleanly on shutdown.
 /// Why:      Serialises control clients (a test harness connects one at a time), keeping
-///           the protocol simple.
-fn control_thread(listener: UnixListener, sender: Sender<ControlRequest>) {
+///           the protocol simple, and exits without leaking when `stop` is set.
+fn control_thread(listener: UnixListener, sender: Sender<ControlRequest>, stop: Arc<AtomicBool>) {
     // What:     `for incoming in listener.incoming() { ... }`. Iterate accepted connections;
     //           `incoming()` yields `Result<UnixStream>` blockingly.
     // Why:      Serve each control client.
     for incoming in listener.incoming() {
+        // What:     `if stop.load(..) { break; }`. Bail out when shutdown asked us to.
+        // Why:      `shutdown` sets the flag then self-connects to wake this `accept`; the
+        //           woken iteration observes the flag and the loop ends, so the thread is
+        //           joinable and the listener fd is released.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         // What:     `match incoming { Ok(stream) => ..., Err(err) => { warn!; break; } }`.
         //           Handle a connection or log-and-stop on an accept error.
         // Why:      Keep serving until a fatal accept error.

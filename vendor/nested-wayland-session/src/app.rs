@@ -16,7 +16,7 @@ use smithay::{
     reexports::{
         calloop::{
             timer::{TimeoutAction, Timer},
-            EventLoop, LoopHandle,
+            EventLoop, LoopHandle, LoopSignal,
         },
         wayland_server::Display,
     },
@@ -59,7 +59,8 @@ use crate::{
     backend::init_headless_backend,
     child::{register_exit_poll, spawn_child},
     cli::Config,
-    clipboard, control,
+    clipboard,
+    control::{self, ControlHandle},
     input::{drain_input, SpikeInput},
     render::{read_frame_rgba, redraw},
     state::Compositor,
@@ -217,11 +218,19 @@ pub fn run(config: Config) -> Result<i32> {
 
 /// A handle to a headless compositor running on its own thread.
 ///
-/// What:     `pub struct HeadlessHandle { socket_name: String, thread:
-///           Option<JoinHandle<Result<()>>> }`. Owns the compositor thread and remembers
-///           the Wayland socket it advertised.
-/// Why:      Lets a host process (e.g. the spike) learn the socket to point clients at,
-///           and join the thread when done.
+/// What:     `pub struct HeadlessHandle { socket_name: String, ..., loop_signal, control,
+///           thread }`. Owns the compositor thread + control thread and remembers the
+///           Wayland socket it advertised.
+/// Why:      Lets a host process (e.g. an embedding GTK widget) learn the socket to point
+///           clients at, drive the control API, and tear everything down deterministically.
+///
+/// # Lifecycle
+///
+/// The compositor and its hosted client live for as long as this handle does. Presenting
+/// frames, forwarding input, and pausing a frame pump (e.g. when an embedding widget is
+/// hidden/unmapped) never touch the handle — the compositor keeps running with the client's
+/// state intact. Only [`HeadlessHandle::shutdown`] (or dropping the handle) stops the
+/// compositor thread, joins the control thread, and unlinks the control socket file.
 pub struct HeadlessHandle {
     /// The advertised `WAYLAND_DISPLAY` socket name (e.g. `wayland-1`).
     socket_name: String,
@@ -235,7 +244,11 @@ pub struct HeadlessHandle {
     clipboard_from_nested: crossbeam_channel::Receiver<String>,
     /// SPIKE SCOPE: text the host clipboard holds, to be offered to the hosted client.
     clipboard_to_nested: Sender<String>,
-    /// The running compositor thread, taken on `join`.
+    /// Signal used to stop the event loop on `shutdown`/drop. `None` once torn down.
+    loop_signal: Option<LoopSignal>,
+    /// Joinable handle to the control thread + its socket file. `None` once torn down.
+    control: Option<ControlHandle>,
+    /// The running compositor thread, taken on `shutdown`/`join`.
     thread: Option<thread::JoinHandle<Result<()>>>,
 }
 
@@ -309,6 +322,50 @@ impl HeadlessHandle {
             let _ = thread.join();
         }
     }
+
+    /// Stop the compositor, join every thread it owns, and unlink the control socket.
+    ///
+    /// What:     `pub fn shutdown(&mut self)`. Signals the calloop event loop to stop (and
+    ///           wakes it so it observes the stop promptly), joins the compositor thread,
+    ///           then stops and joins the control thread and removes its socket file.
+    ///           Idempotent: every owned resource is taken behind an `Option`, so a second
+    ///           call (or `Drop` after an explicit call) is a no-op.
+    /// Why:      This is the ONLY teardown path. An embedding widget calls it on `dispose`
+    ///           (or offers an explicit `close()`); hiding/unmapping the widget must NOT.
+    ///           After it returns there are no leaked threads, sockets, or fds: the
+    ///           compositor thread has exited (releasing its EGL/render-node resources when
+    ///           the state drops), the control thread has been woken out of `accept` and
+    ///           joined, and the control socket file is gone.
+    pub fn shutdown(&mut self) {
+        // Stop the event loop and wake it out of any poll wait so it returns now, not at
+        // the next unrelated event.
+        if let Some(signal) = self.loop_signal.take() {
+            signal.stop();
+            signal.wakeup();
+        }
+        // Join the compositor thread; dropping its `Compositor` state releases EGL / the
+        // render node and the Wayland listening socket.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        // Stop and join the control thread, then unlink the control socket file.
+        if let Some(control) = self.control.take() {
+            control.shutdown();
+        }
+        self.control_socket_path = None;
+    }
+}
+
+/// Tear the compositor down when the last handle is dropped.
+///
+/// What:     `impl Drop for HeadlessHandle`. Calls [`HeadlessHandle::shutdown`].
+/// Why:      Binds the compositor's lifetime to the handle's: whoever holds the handle
+///           holds the browser. Dropping the last reference (e.g. an embedding widget being
+///           finalised) destroys the compositor and its hosted client, with no leaks.
+impl Drop for HeadlessHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// What the compositor thread hands back once it is listening.
@@ -327,6 +384,10 @@ struct Ready {
     clipboard_from_nested: crossbeam_channel::Receiver<String>,
     /// SPIKE SCOPE: text observed on the host clipboard.
     clipboard_to_nested: Sender<String>,
+    /// The event loop's stop signal, so the caller can shut the compositor down.
+    loop_signal: LoopSignal,
+    /// The control thread's joinable handle (+ socket path), for deterministic teardown.
+    control: ControlHandle,
 }
 
 /// Start a headless compositor on its own thread and return once it is listening.
@@ -384,22 +445,29 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
 
             // What:     Bind the control socket so the host can drive `type`/`click`/
             //           `screenshot` (the seat-injection proof path). Failing to start it is
-            //           reported like any other startup failure.
+            //           reported like any other startup failure. The returned handle is kept
+            //           so the caller can join the control thread on shutdown.
             // Why:      Headless mode hosted no child and never bound a control socket; the
-            //           spike needs one to inject input through the seat over Unix.
-            {
+            //           embedder needs one to inject input through the seat over Unix.
+            let control = {
                 let loop_handle = event_loop.handle();
-                if let Err(err) = control::start(&loop_handle, &control_socket_thread_path) {
-                    let _ = ready_tx.send(Err(anyhow!("starting the control socket failed: {err:#}")));
-                    return Err(err);
+                match control::start(&loop_handle, &control_socket_thread_path) {
+                    Ok(control) => control,
+                    Err(err) => {
+                        let _ = ready_tx
+                            .send(Err(anyhow!("starting the control socket failed: {err:#}")));
+                        return Err(err);
+                    }
                 }
-            }
+            };
 
             // What:     Send the advertised socket name, a clone of the shared frame slot,
-            //           and a clone of the input sender back to the caller.
+            //           the input sender, the loop stop signal, and the control handle back
+            //           to the caller.
             // Why:      Unblocks `spawn_headless` so it can return the handle; the cloned
-            //           `Arc` lets the GTK host read frames, and the sender lets it enqueue
-            //           real GTK input into the seat.
+            //           `Arc` lets the GTK host read frames, the sender lets it enqueue real
+            //           GTK input into the seat, and the signal + control handle let it tear
+            //           the compositor down deterministically.
             let ready = Ready {
                 socket_name: state.socket_name.to_string_lossy().into_owned(),
                 latest_frame: Arc::clone(&state.latest_frame),
@@ -407,6 +475,8 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
                 // SPIKE SCOPE: the two halves the GTK host needs to bridge clipboards.
                 clipboard_from_nested: state.clipboard.to_host_rx.clone(),
                 clipboard_to_nested: state.clipboard.from_host_tx.clone(),
+                loop_signal: state.loop_signal.clone(),
+                control,
             };
             if ready_tx.send(Ok(ready)).is_err() {
                 // What:     The caller dropped the receiver; nothing to host.
@@ -440,6 +510,8 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
             control_socket_path: Some(control_socket_path),
             clipboard_from_nested: ready.clipboard_from_nested,
             clipboard_to_nested: ready.clipboard_to_nested,
+            loop_signal: Some(ready.loop_signal),
+            control: Some(ready.control),
             thread: Some(thread),
         }),
         Ok(Err(err)) => {

@@ -16,9 +16,16 @@ tracing.workspace = true
 [dev-dependencies]
 libadwaita.workspace = true
 
+# Single-pane demo: one WaylandPane filling an adw::ApplicationWindow.
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
+
+# Three WaylandPanes side by side in one window, each with a HIDE/SHOW toggle that
+# preserves the hosted client (the state-preservation contract made visible).
+[[example]]
+name = "multi"
+path = "examples/multi.rs"
 
 # Headless multi-instance gate: proves N=3 nested-compositor instances coexist in
 # ONE process, each hosting its own isolated Wayland client, with NO GTK window.
