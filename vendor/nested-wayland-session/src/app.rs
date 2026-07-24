@@ -31,10 +31,27 @@ use anyhow::{anyhow, Context, Result};
 ///           shared-frame slot back over a channel; the redraw timer is scheduled by a
 ///           `Duration` and the latest readback is published behind `Arc<Mutex<_>>`.
 use std::{
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
+
+/// Process-global monotonic counter making each headless instance's default
+/// control-socket path unique.
+///
+/// What:     `static INSTANCE_SEQ: AtomicU64`. Bumped once per `spawn_headless`.
+/// Why:      The default control-socket path used to be keyed on the PID alone
+///           (`kabelsalat-spike-control-<pid>.sock`). Two or more headless
+///           instances in ONE process share a PID, so they collided: each
+///           `bind_listener` unlinks the pre-existing file and re-binds, silently
+///           orphaning the earlier instances' listeners. A per-instance sequence
+///           number appended to the PID makes the default path unique so N
+///           instances coexist. (Set `KABELSALAT_SPIKE_CONTROL` to force one path
+///           only when you intend a single instance.)
+static INSTANCE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// What:     Grouped `use` of our own modules' items.
 /// Why:      Orchestration calls into backend, child, control, render, and state.
@@ -327,13 +344,23 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<Ready>>();
 
     // What:     Choose a control-socket path up front (before the thread) so the returned
-    //           handle can expose it. Unique per process to avoid colliding runs.
+    //           handle can expose it. Unique per INSTANCE, not just per process.
     // Why:      The seat-injection proof drives the `type`/`click`/`screenshot` control API;
     //           headless mode did not previously start a control socket, so start one here.
+    //           The default path formerly used the PID alone, so N instances in ONE process
+    //           (same PID) collided — `bind_listener` unlinks the stale file and re-binds,
+    //           orphaning the earlier instances. Appending a monotonic per-instance sequence
+    //           number keeps each instance's path distinct. `KABELSALAT_SPIKE_CONTROL` still
+    //           forces a fixed path (single-instance use only).
     let control_socket_path = std::env::var_os("KABELSALAT_SPIKE_CONTROL")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("kabelsalat-spike-control-{}.sock", std::process::id()))
+            let seq = INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "kabelsalat-spike-control-{}-{}.sock",
+                std::process::id(),
+                seq
+            ))
         });
     let control_socket_thread_path = control_socket_path.clone();
 

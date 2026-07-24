@@ -19,3 +19,10 @@ libadwaita.workspace = true
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
+
+# Headless multi-instance gate: proves N=3 nested-compositor instances coexist in
+# ONE process, each hosting its own isolated Wayland client, with NO GTK window.
+# Run: cargo run --example multi_headless
+[[example]]
+name = "multi_headless"
+path = "examples/multi_headless.rs"
