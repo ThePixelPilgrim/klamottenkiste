@@ -623,12 +623,18 @@ fn finish_backend_setup(
     // Why:      Advertise the screen to clients.
     let _global = output.create_global::<crate::state::Compositor>(display_handle);
 
-    // What:     Make the mode current with a Y-flip transform and origin position.
-    // Why:      GL's framebuffer origin is bottom-left, opposite Wayland's top-left, so
-    //           the readback path expects the flip (matching the original winit setup).
+    // What:     Make the mode current with the identity transform and origin position.
+    // Why:      Render the composited frame top-down directly into the target's memory, so the
+    //           raw FBO handed to GTK as a dmabuf is already upright (row 0 = top). GL's
+    //           framebuffer origin is bottom-left, but `render_output` bakes the output
+    //           transform into its projection: with `Transform::Normal` the scene is written so
+    //           that buffer memory row 0 is the top of the image — exactly what GTK/DRM sample
+    //           top-down. The old `Flipped180` produced bottom-up memory, which forced the
+    //           readback to flip on the CPU and left the zero-copy dmabuf upside-down. With the
+    //           identity transform the readback needs no flip either (see `render::read_frame_rgba`).
     output.change_current_state(
         Some(mode),
-        Some(Transform::Flipped180),
+        Some(Transform::Normal),
         None,
         Some((0, 0).into()),
     );

@@ -74,10 +74,11 @@ pub const BYTES_PER_PIXEL: usize = 4;
 /// channels most- to least-significant within a little-endian 32-bit word, so `Abgr8888` is
 /// byte order R, G, B, A.
 ///
-/// Orientation: the nested `Output` uses `Transform::Flipped180`, and `glReadPixels` hands
-/// back bottom-up rows, so the raw readback is upside-down; this function flips vertically
-/// before returning (the same flip the old `screenshot.rs` did when writing PNGs). The
-/// returned buffer is tightly packed (`stride == width * 4`).
+/// Orientation: the nested `Output` uses `Transform::Normal`, so `render_output` composites
+/// the frame top-down directly into the target's memory (row 0 = top). `copy_framebuffer`
+/// hands those rows back in the same order, so the readback is already upright and this
+/// function returns it without a flip — the same top-down memory the zero-copy dmabuf path
+/// exports. The returned buffer is tightly packed (`stride == width * 4`).
 ///
 /// MUST be called on the compositor thread, where the GLES context is current (e.g. from the
 /// redraw timer, right after `redraw`). It is the single readback primitive shared by the GTK
@@ -90,9 +91,10 @@ pub fn read_frame_rgba(state: &mut Compositor) -> (Vec<u8>, u32, u32, usize) {
     let width = size.w as u32;
     let height = size.h as u32;
 
-    // What:     Bottom-up pixels as `glReadPixels`/`copy_framebuffer` return them.
-    // Why:      Filled inside the bind scope, flipped to upright afterwards.
-    let mut bottom_up: Vec<u8> = Vec::new();
+    // What:     The composited pixels as `copy_framebuffer` returns them (top-down, upright).
+    // Why:      Filled inside the bind scope, then returned as-is (the `Transform::Normal`
+    //           output already wrote the frame top-down, so no CPU flip is needed).
+    let mut upright: Vec<u8> = Vec::new();
 
     // What:     A block scoping the render/readback borrows so they end before the flip.
     // Why:      `bind` borrows the backend mutably; release it after copying pixels out.
@@ -135,24 +137,16 @@ pub fn read_frame_rgba(state: &mut Compositor) -> (Vec<u8>, u32, u32, usize) {
         let pixels = renderer
             .map_texture(&mapping)
             .expect("mapping the readback texture failed");
-        bottom_up.extend_from_slice(pixels);
+        upright.extend_from_slice(pixels);
     }
 
     // What:     Row stride in bytes (tightly packed).
     // Why:      Each row is `width` RGBA pixels.
     let stride = width as usize * BYTES_PER_PIXEL;
 
-    // What:     Copy each source row into its mirrored destination row.
-    // Why:      The readback is bottom-up; callers (GTK texture, PNG) want top-down.
-    let mut upright = vec![0u8; bottom_up.len()];
-    for row in 0..height as usize {
-        let src = &bottom_up[row * stride..(row + 1) * stride];
-        let dst_row = height as usize - 1 - row;
-        upright[dst_row * stride..(dst_row + 1) * stride].copy_from_slice(src);
-    }
-
-    // What:     Return upright RGBA bytes plus dimensions and stride.
-    // Why:      The caller wraps these in a `GdkMemoryTexture` or encodes a PNG.
+    // What:     Return the RGBA bytes plus dimensions and stride, unflipped.
+    // Why:      The `Transform::Normal` output composites top-down, so `copy_framebuffer`
+    //           already handed back upright rows — callers (GTK texture, PNG) want top-down.
     (upright, width, height, stride)
 }
 
