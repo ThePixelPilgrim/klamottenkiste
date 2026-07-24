@@ -119,7 +119,77 @@ mod imp {
     use std::time::Duration;
 
     use gtk::gdk;
-    use nested_wayland_session::{spawn_headless, HeadlessHandle};
+    use nested_wayland_session::{spawn_headless, DmabufFrame, HeadlessHandle};
+
+    /// Whether the widget should prefer the zero-copy dmabuf present path.
+    ///
+    /// Mirrors the compositor's own `KLAMOTTENKISTE_PRESENT` selection: `readback` forces the
+    /// CPU `MemoryTexture` path; anything else (including unset) prefers dmabuf import. If the
+    /// compositor internally fell back to readback (pool alloc failed) or has not produced a
+    /// dmabuf frame yet, `pump_tick` still falls through to the readback path, so this is a
+    /// preference, not a hard commitment.
+    fn present_dmabuf_preferred() -> bool {
+        !matches!(
+            std::env::var("KLAMOTTENKISTE_PRESENT"),
+            Ok(value) if value.eq_ignore_ascii_case("readback")
+        )
+    }
+
+    /// Import a compositor dmabuf slot as a zero-copy [`gdk::Texture`], wiring slot release.
+    ///
+    /// Builds a `GdkDmabufTexture` from the borrowed per-plane fds in `frame` and attaches a
+    /// release closure that returns the pool slot (`frame.buffer_id`) to the compositor over
+    /// `release_tx` only once GTK has finished sampling the texture. GTK does **not** take
+    /// ownership of the fds (GTK4 semantics), so the compositor must keep them valid until
+    /// that release fires — which the closure guarantees. On build failure GTK never runs the
+    /// closure, so the slot is released here to avoid pinning it `in_flight` forever.
+    fn build_dmabuf_texture(
+        frame: &DmabufFrame,
+        display: &gdk::Display,
+        release_tx: Sender<u64>,
+    ) -> Result<gdk::Texture, glib::Error> {
+        let mut builder = gdk::DmabufTextureBuilder::new()
+            .set_display(display)
+            .set_width(frame.width)
+            .set_height(frame.height)
+            .set_fourcc(frame.fourcc)
+            .set_modifier(frame.modifier)
+            .set_n_planes(frame.planes.len() as u32)
+            // Straight alpha, matching the readback path's `R8g8b8a8` (non-premultiplied).
+            // For the opaque compositor output this is moot, but it keeps both paths identical.
+            .set_premultiplied(false);
+
+        for (index, plane) in frame.planes.iter().enumerate() {
+            let idx = index as u32;
+            // SAFETY: `plane.fd` is owned by the compositor's pool slot and stays valid until
+            // `frame.buffer_id` is sent back through `release_tx`. The release closure below
+            // does exactly that when GTK is done with the texture, satisfying `set_fd`'s
+            // "fd must outlive the texture" contract.
+            builder = unsafe { builder.set_fd(idx, plane.fd) }
+                .set_offset(idx, plane.offset)
+                .set_stride(idx, plane.stride);
+        }
+
+        let buffer_id = frame.buffer_id;
+        let release_on_drop = release_tx.clone();
+        // SAFETY: every plane's fd/offset/stride is set above; the release closure returns the
+        // pool slot to the compositor only after GTK finishes sampling, so the borrowed fds
+        // outlive every read GTK performs. The closure is `FnOnce + Send + 'static` (it moves a
+        // crossbeam `Sender<u64>` and a `u64`), as `build_with_release_func` requires.
+        let result = unsafe {
+            builder.build_with_release_func(move || {
+                let _ = release_on_drop.send(buffer_id);
+            })
+        };
+
+        if result.is_err() {
+            // Build failed: GTK produced no texture and will NOT run the release closure, so
+            // hand the slot back ourselves — otherwise it stays `in_flight` and shrinks the
+            // pool by one every frame.
+            let _ = release_tx.send(buffer_id);
+        }
+        result
+    }
 
     /// Private state of [`super::WaylandPane`].
     pub struct WaylandPane {
@@ -129,6 +199,12 @@ mod imp {
         pub(super) handle: RefCell<Option<HeadlessHandle>>,
         /// Clone of the seat-input sender (or `None` if startup failed / closed).
         pub(super) input_tx: RefCell<Option<Sender<SpikeInput>>>,
+        /// Clone of the dmabuf slot-release sender (dmabuf path; `None` if startup failed).
+        pub(super) release_tx: RefCell<Option<Sender<u64>>>,
+        /// Whether to prefer the zero-copy dmabuf present path (from `KLAMOTTENKISTE_PRESENT`).
+        pub(super) present_dmabuf: Cell<bool>,
+        /// Latched once a dmabuf import has failed, so the fallback warning prints only once.
+        pub(super) dmabuf_warned: Cell<bool>,
         /// Current nested output size (device px); read by every coordinate mapping.
         pub(super) out_size: Cell<(f64, f64)>,
         /// Last (logical w, logical h, scale) pushed to the compositor by the resize poll.
@@ -152,6 +228,9 @@ mod imp {
                 picture: gtk::Picture::new(),
                 handle: RefCell::new(None),
                 input_tx: RefCell::new(None),
+                release_tx: RefCell::new(None),
+                present_dmabuf: Cell::new(present_dmabuf_preferred()),
+                dmabuf_warned: Cell::new(false),
                 out_size: Cell::new((INIT_OUT_W as f64, INIT_OUT_H as f64)),
                 applied: Cell::new((0, 0, 0)),
                 pump_source: RefCell::new(None),
@@ -212,6 +291,7 @@ mod imp {
             match spawn_headless(INIT_OUT_W, INIT_OUT_H) {
                 Ok(handle) => {
                     *self.input_tx.borrow_mut() = Some(handle.input_sender());
+                    *self.release_tx.borrow_mut() = Some(handle.release_sender());
                     *self.handle.borrow_mut() = Some(handle);
                 }
                 Err(err) => {
@@ -235,6 +315,10 @@ mod imp {
                 handle.shutdown();
             }
             *self.input_tx.borrow_mut() = None;
+            *self.release_tx.borrow_mut() = None;
+
+            // Drop any imported dmabuf texture so no pool slot outlives the compositor.
+            self.picture.set_paintable(gdk::Paintable::NONE);
 
             // Unparent the child so GTK does not warn about a still-parented widget.
             self.picture.unparent();
@@ -265,6 +349,11 @@ mod imp {
             // hosted client keep running with their state intact.
             self.stop_pump();
             self.stop_resize_poll();
+            // Drop any imported dmabuf texture so its release closure fires and the pool slot
+            // returns to the compositor — a hidden pane must pin no buffer. Harmless for the
+            // readback path: the next `map` repaints within one pump tick. This returns a
+            // buffer to the pool but does NOT touch the compositor's client state.
+            self.picture.set_paintable(gdk::Paintable::NONE);
             self.parent_unmap();
         }
     }
@@ -429,24 +518,67 @@ mod imp {
                     #[upgrade_or]
                     glib::ControlFlow::Break,
                     move || {
-                        let imp = obj.imp();
-                        let frame = imp.handle.borrow().as_ref().and_then(|h| h.latest_frame());
-                        if let Some(frame) = frame {
-                            let bytes = glib::Bytes::from(&frame.bytes);
-                            let texture = gdk::MemoryTexture::new(
-                                frame.width as i32,
-                                frame.height as i32,
-                                gdk::MemoryFormat::R8g8b8a8,
-                                &bytes,
-                                frame.stride,
-                            );
-                            imp.picture.set_paintable(Some(&texture));
-                        }
+                        obj.imp().pump_tick(&obj);
                         glib::ControlFlow::Continue
                     }
                 ),
             );
             *self.pump_source.borrow_mut() = Some(id);
+        }
+
+        /// Present one frame: the dmabuf zero-copy path when preferred, else CPU readback.
+        ///
+        /// In dmabuf-preferred mode it imports the compositor's latest dmabuf slot as a
+        /// `GdkDmabufTexture` (zero-copy) and sets it as the `Picture` paintable. If no dmabuf
+        /// frame exists yet, the compositor internally fell back to readback, or GTK rejected
+        /// the fourcc/modifier, it falls through to [`Self::present_readback`]. In readback mode
+        /// it only ever uses the CPU `MemoryTexture` path. Runs on the GTK main thread.
+        fn pump_tick(&self, obj: &super::WaylandPane) {
+            if self.present_dmabuf.get() {
+                let frame = self.handle.borrow().as_ref().and_then(|h| h.latest_dmabuf());
+                if let Some(frame) = frame {
+                    if let Some(release_tx) = self.release_tx.borrow().clone() {
+                        match build_dmabuf_texture(&frame, &obj.display(), release_tx) {
+                            Ok(texture) => {
+                                self.picture.set_paintable(Some(&texture));
+                                return;
+                            }
+                            Err(err) => {
+                                // GTK rejected the buffer (fourcc/modifier). The slot was
+                                // already released inside `build_dmabuf_texture`; fall through
+                                // to readback. Warn once — this fires at ~60 Hz otherwise.
+                                if !self.dmabuf_warned.replace(true) {
+                                    eprintln!(
+                                        "KstWaylandPane: dmabuf import failed ({err}); \
+                                         falling back to readback. Set \
+                                         KLAMOTTENKISTE_PRESENT=readback to silence this."
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // No dmabuf frame yet, an internal readback fallback, or a failed import:
+                // try the CPU readback slot (empty in a healthy dmabuf run, populated if the
+                // compositor itself fell back to readback).
+            }
+            self.present_readback();
+        }
+
+        /// Present the latest CPU-readback frame as a `MemoryTexture`, if one exists.
+        fn present_readback(&self) {
+            let frame = self.handle.borrow().as_ref().and_then(|h| h.latest_frame());
+            if let Some(frame) = frame {
+                let bytes = glib::Bytes::from(&frame.bytes);
+                let texture = gdk::MemoryTexture::new(
+                    frame.width as i32,
+                    frame.height as i32,
+                    gdk::MemoryFormat::R8g8b8a8,
+                    &bytes,
+                    frame.stride,
+                );
+                self.picture.set_paintable(Some(&texture));
+            }
         }
 
         /// Pause the frame pump if running. Does NOT touch the compositor. Idempotent.
@@ -565,6 +697,9 @@ impl WaylandPane {
             handle.shutdown();
         }
         *imp.input_tx.borrow_mut() = None;
+        *imp.release_tx.borrow_mut() = None;
+        // Drop any imported dmabuf texture so no pool slot outlives the compositor.
+        imp.picture.set_paintable(gtk::gdk::Paintable::NONE);
     }
 }
 

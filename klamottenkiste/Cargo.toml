@@ -33,3 +33,10 @@ path = "examples/multi.rs"
 [[example]]
 name = "multi_headless"
 path = "examples/multi_headless.rs"
+
+# Headless GTK-import proof for the zero-copy dmabuf present path: gtk::init (no window),
+# import the compositor's exported dmabuf via GdkDmabufTextureBuilder, download its pixels,
+# and confirm they match foot's rendered content. Run: cargo run --example dmabuf_import_check
+[[example]]
+name = "dmabuf_import_check"
+path = "examples/dmabuf_import_check.rs"
