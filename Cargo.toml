@@ -5,7 +5,7 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "LGPL-3.0-or-later"
-repository = "https://github.com/nereide/klamottenkiste"
+repository = "https://github.com/ThePixelPilgrim/klamottenkiste"
 
 [workspace.dependencies]
 # v4_18: the widget needs `ContentFit` (4.8+) and the demo targets the 4.20 system GTK.

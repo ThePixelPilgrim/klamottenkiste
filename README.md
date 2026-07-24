@@ -65,7 +65,7 @@ WAYLAND_DISPLAY=<socket> google-chrome --ozone-platform=wayland --new-window <ur
 
 ## Origin
 
-Extracted from a spike in [kabelsalat](https://github.com/nereide/kabelsalat), which wanted a
+Extracted from a spike in [kabelsalat](https://github.com/ThePixelPilgrim/kabelsalat), which wanted a
 per-tab-group embedded browser pane. The embedding machinery is generally useful on its own, so it
 lives here; kabelsalat consumes it as a library.
 
