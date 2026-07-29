@@ -342,6 +342,16 @@ mod imp {
             // compositor, which is already running.
             self.start_pump();
             self.start_resize_poll();
+            // Seat keyboard focus mirrors this widget's GTK focus, and unmapping cleared it
+            // (`SpikeInput::Focus(false)` → `keyboard.set_focus(None)`). GTK does not re-emit
+            // focus-enter for a widget remapped while it still holds focus — an embedder that
+            // unparents and reparents the pane hits exactly that — so re-assert it here.
+            // Without this the hosted client stays deaf until the next click, silently.
+            if self.obj().has_focus()
+                && let Some(tx) = self.input_tx.borrow().as_ref()
+            {
+                let _ = tx.send(SpikeInput::Focus(true));
+            }
         }
 
         fn unmap(&self) {
