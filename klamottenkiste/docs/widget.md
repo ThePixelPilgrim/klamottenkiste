@@ -107,7 +107,9 @@ Headless / build-only (no GTK window is opened — a real window would steal foc
 
 * `cargo build --examples` links `demo`, `multi`, and `multi_headless`.
 * `cargo test -p monochromatic-nested-wayland-session` — 31 unit tests + 1 lifecycle
-  integration test, 0 doctests.
+  integration test, 0 doctests. Two further integration binaries (`xwayland`,
+  `xwayland_e2e`) each hold one `#[ignore]`d Xwayland gate test, so they report
+  `1 ignored` here and only run when asked for (see below).
 * `cargo test -p klamottenkiste --lib` — 6 unit tests for the pure widget logic
   (`widget_to_output` against the **runtime** output size, `requested_output`,
   `gtk_button_to_evdev`).
@@ -132,12 +134,22 @@ page state) needs a display and is left to the user.
 ### Xwayland readiness gate
 
 Two `#[ignore]`d integration tests certify Xwayland support
-(`docs/superpowers/specs/2026-07-30-xwayland-test-harness-design.md`): red
+([spec](../../docs/superpowers/specs/2026-07-30-xwayland-test-harness-design.md)): red
 with a self-explaining message until the feature lands, green when an X11
 client maps, composites, and receives input headlessly. Requires an
 `Xwayland` binary on `PATH` (Fedora: `xorg-x11-server-Xwayland`).
 
+They live in one test binary each — `tests/xwayland.rs` (display advertisement)
+and `tests/xwayland_e2e.rs` (client maps, composites, echoes injected input,
+tears down cleanly) — so each can set `KLAMOTTENKISTE_PRESENT` directly at test
+start; there is no `--test-threads=1` requirement. The build step is not
+optional: `xwayland_e2e` spawns `target/debug/x11-echo` directly.
+
     cargo build -p x11-echo
-    cargo test -p monochromatic-nested-wayland-session --test xwayland -- --ignored --test-threads=1
+    cargo test -p monochromatic-nested-wayland-session --test xwayland --test xwayland_e2e \
+        --no-fail-fast -- --ignored
+
+`--no-fail-fast` because cargo stops after the first failing test *binary*, and
+while the gate is red both of them fail.
 
 [Smithay]: https://github.com/Smithay/smithay

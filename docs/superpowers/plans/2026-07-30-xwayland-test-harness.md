@@ -13,7 +13,7 @@
 - Everything runs headless: no GTK, no display session, no `gtk::init()`.
 - The library crate `monochromatic-nested-wayland-session` (lib name `nested_wayland_session`) gains **no new dependencies**; `x11rb` lives only in the new `x11-echo` bin crate.
 - Both harness tests carry `#[ignore = "red until Xwayland support lands"]` so plain `cargo test` stays green.
-- Env var `KLAMOTTENKISTE_PRESENT=readback` must be set before any `spawn_headless` call (readback frames feed `latest_frame()`); in a multi-test binary this write must go through `std::sync::Once` and the gate is run with `--test-threads=1`.
+- Env var `KLAMOTTENKISTE_PRESENT=readback` must be set before any `spawn_headless` call (readback frames feed `latest_frame()`); in a multi-test binary this write must go through `std::sync::Once` and the gate is run with `--test-threads=1`. *(Superseded by final review: the gate ships as two single-test binaries, so the write is a plain `set_var` at test start and `--test-threads=1` is gone — see the spec's "Amended after final review" note.)*
 - A missing `Xwayland` binary on `PATH` is an environment error: fail with install hint `Fedora: xorg-x11-server-Xwayland`, never a silent skip.
 - Doc-comment style in the vendored crate uses the existing `What:` / `Why:` convention — follow it.
 - Workspace license is LGPL-3.0-or-later; new crate inherits via `license.workspace = true`.
@@ -570,8 +570,23 @@ git commit -m "Harness: Xwayland readiness gate tests"
 
 ## Verification after all tasks
 
-1. `cargo fmt --all -- --check` — clean (run `cargo fmt --all` first if needed).
-2. `cargo clippy --workspace` — no new warnings.
-3. `cargo test --workspace` — everything green, `xwayland` tests listed as ignored.
-4. The gate command (Task 3 Step 3) fails exactly 2 tests, both with the
-   "not implemented yet" message.
+Scoped deliberately: workspace-wide `cargo fmt --all -- --check` and
+`cargo clippy --workspace` both fail on pre-existing debt that predates this
+work (237 `clippy::implicit_return` violations in the vendored crate, plus
+unformatted `klamottenkiste/examples/*`), so they cannot serve as a gate here.
+
+1. `rustfmt --edition 2024 --check` on the files this work touches
+   (`vendor/nested-wayland-session/tests/xwayland.rs`,
+   `vendor/nested-wayland-session/tests/xwayland_e2e.rs`,
+   `test-clients/x11-echo/src/main.rs`) — clean.
+2. `cargo clippy -p x11-echo` — clean.
+3. `cargo test --workspace` — everything green; each Xwayland gate binary
+   reports `1 ignored`.
+4. The gate command fails exactly 2 tests, both with the "not implemented yet"
+   message:
+
+   ```sh
+   cargo build -p x11-echo
+   cargo test -p monochromatic-nested-wayland-session --test xwayland --test xwayland_e2e \
+       --no-fail-fast -- --ignored
+   ```

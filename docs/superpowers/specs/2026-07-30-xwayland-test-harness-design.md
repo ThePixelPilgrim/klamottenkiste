@@ -1,7 +1,25 @@
 # Xwayland readiness test harness
 
 Date: 2026-07-30
-Status: approved
+Status: approved (amended after final review, 2026-07-30)
+
+## Amended after final review (2026-07-30)
+
+Implementation review changed three things from the approved design; the body
+below is updated to match, and this note records the deltas:
+
+1. **The client is spawned directly, not via `cargo run`.** The test locates
+   `target/<profile>/x11-echo` relative to its own executable. Via `cargo run`,
+   kill-on-drop killed the cargo wrapper rather than the client, and the paint
+   deadline had to absorb a possible cold compile.
+2. **Two single-test binaries instead of one two-test file.**
+   `tests/xwayland.rs` and `tests/xwayland_e2e.rs`. With exactly one test per
+   binary, `KLAMOTTENKISTE_PRESENT` can be set with a plain
+   `unsafe { std::env::set_var(..) }` at test start — the same safety argument
+   `lifecycle.rs` uses — instead of a `std::sync::Once` whose soundness leaned
+   on a `--test-threads=1` convention a caller could forget.
+3. **The gate command changed accordingly** (both binaries, `--no-fail-fast`,
+   no `--test-threads=1`).
 
 ## Purpose
 
@@ -61,21 +79,44 @@ dependency tree. Behavior:
   `mapped`, `exposed`, `key-press <keycode>`, `button-press <n>`.
 
 Magenta is chosen because nothing else in the compositor's output (black clear
-color, no decorations, single hosted window) can produce it accidentally. The
-integration test spawns the client via `cargo run -p x11-echo` — the same
-spirit as `lifecycle.rs` spawning system `foot`, but with deterministic pixels
-and an input-echo channel `foot` cannot provide.
+color, no decorations, single hosted window) can produce it accidentally. It is
+the same spirit as `lifecycle.rs` spawning system `foot`, but with
+deterministic pixels and an input-echo channel `foot` cannot provide.
 
-### 3. The gate: `vendor/nested-wayland-session/tests/xwayland.rs`
+The integration test spawns the **pre-built binary directly** from
+`target/<profile>/x11-echo`, located relative to the test executable's own path
+(`current_exe()`'s grandparent is the profile dir). The gate command builds it
+first. Direct spawn, not `cargo run -p x11-echo`: the client is then a real
+child of the test process, so kill-on-drop kills the client rather than a cargo
+wrapper, and no compile can happen inside a wait deadline. (`CARGO_BIN_EXE_*`
+is not an option — cargo only generates it for bins of the package under test.)
 
-Both tests `#[ignore]`, run via:
+### 3. The gate: two single-test binaries
+
+`vendor/nested-wayland-session/tests/xwayland.rs` and
+`vendor/nested-wayland-session/tests/xwayland_e2e.rs` — one `#[ignore]`d test
+each, run via:
 
 ```
-cargo test -p monochromatic-nested-wayland-session --test xwayland -- --ignored
+cargo build -p x11-echo
+cargo test -p monochromatic-nested-wayland-session --test xwayland --test xwayland_e2e \
+    --no-fail-fast -- --ignored
 ```
 
-Both use `KLAMOTTENKISTE_PRESENT=readback` (CPU-readback frames, as in
-`lifecycle.rs`) and deadline-polling helpers copied from that test's style.
+`--no-fail-fast` because cargo stops after the first failing test binary and,
+while the gate is red, both fail.
+
+One test per binary rather than one file with two tests: each can then set
+`KLAMOTTENKISTE_PRESENT=readback` (CPU-readback frames, as in `lifecycle.rs`)
+with a plain `unsafe { std::env::set_var(..) }` at test start, justified the
+same way `lifecycle.rs` justifies it — the binary runs exactly one test, so
+there is no concurrent reader. The alternative, a `std::sync::Once` in a
+two-test binary, is only sound under `--test-threads=1`, a convention the
+caller can silently drop. The cost is a handful of duplicated helpers between
+the two files, which matches how this crate keeps its test binaries
+self-contained.
+
+Both use deadline-polling helpers copied from `lifecycle.rs`'s style.
 
 **`x11_display_advertised`** — fast first gate:
 1. Assert `Xwayland` is on `PATH`; panic with an install hint otherwise.
@@ -84,19 +125,27 @@ Both use `KLAMOTTENKISTE_PRESENT=readback` (CPU-readback frames, as in
    x11_display() returned None` — red is self-explaining.
 
 **`x11_client_end_to_end`** — the "done" signal:
-1. Spawn compositor, obtain `DISPLAY` via `x11_display()`.
-2. Spawn `x11-echo` with that `DISPLAY`; capture its stdout.
-3. Wait until `latest_frame()`'s center pixel is magenta (tolerance ±2 per
+1. Snapshot every `Xwayland` PID visible in `/proc` (for step 7).
+2. Spawn compositor, obtain `DISPLAY` via `x11_display()`.
+3. Spawn `target/<profile>/x11-echo` with that `DISPLAY`; capture its stdout
+   and stderr.
+4. Wait for the client's own `mapped`, then `exposed`, lines. This isolates
+   "the client never reached a working X server" from "the client painted but
+   nothing was composited" — without it, both look like a blank frame.
+5. Wait until `latest_frame()`'s center pixel is magenta (tolerance ±2 per
    channel, deadline-polled). This proves the X11 window was WM-mapped and
    composited — not merely connected.
-4. Inject `key a tap` and `click <center-x> <center-y>` over the control
-   socket.
-5. Wait for matching `key-press` and `button-press` lines on the client's
-   stdout. This proves seat focus and input routing reach the X11 world.
-6. `shutdown()`; assert the Xwayland child process is reaped (no zombie, no
-   surviving process), mirroring the fd-leak discipline of `lifecycle.rs`.
+6. Inject `key a tap` and `click <center-x> <center-y>` over the control
+   socket, and wait for matching `key-press` and `button-press` lines on the
+   client's stdout. This proves seat focus and input routing reach the X11
+   world.
+7. `shutdown()`; assert that no `Xwayland` PID absent from step 1's snapshot
+   survives (no zombie, no surviving process), mirroring the fd-leak discipline
+   of `lifecycle.rs`. Parentage is deliberately not part of the filter: a
+   compositor that re-parents or double-forks its Xwayland would otherwise make
+   the check pass vacuously.
 
-Steps 3 and 5 test the two directions of the embedding contract
+Steps 5 and 6 test the two directions of the embedding contract
 independently: compositor→screen and host→client. Either can break without
 the other.
 
@@ -105,7 +154,13 @@ the other.
 - All waits are polls with explicit deadlines (10 s default); every timeout
   message states which stage timed out and what was observed instead.
 - Client stdout is read on a thread with line buffering so a wedged client
-  cannot deadlock the test.
+  cannot deadlock the test. Client **stderr** is drained the same way into a
+  shared buffer, and its last ~10 lines are quoted in every failure message
+  raised after the client is spawned — otherwise an X11 connect error is
+  indistinguishable from a compositor bug.
+- Waiting for a client line yields one of three outcomes — matched, timed out,
+  or *client gone* (stdout hit EOF) — each with its own message. A dead client
+  must never be reported as, say, missing input routing.
 - Compositor and client processes are killed on test panic (RAII guards, as
   in `lifecycle.rs`).
 
