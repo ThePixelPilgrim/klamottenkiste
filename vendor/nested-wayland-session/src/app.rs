@@ -387,6 +387,19 @@ impl HeadlessHandle {
         self.control_socket_path.as_deref()
     }
 
+    /// `DISPLAY` name (e.g. `:2`) of this compositor's Xwayland server.
+    ///
+    /// What:     `pub fn x11_display(&self) -> Option<String>`. Returns `None` while
+    ///           Xwayland support is unimplemented or the X server is not yet ready.
+    /// Why:      The contract seam of the Xwayland readiness harness
+    ///           (`docs/superpowers/specs/2026-07-30-xwayland-test-harness-design.md`):
+    ///           `tests/xwayland.rs` polls this and goes green exactly when a real
+    ///           display name is returned. Filling this in is the Xwayland feature
+    ///           branch's final step.
+    pub fn x11_display(&self) -> Option<String> {
+        None
+    }
+
     /// SPIKE SCOPE: the receiving half for text the hosted client copied.
     ///
     /// What:     `pub fn clipboard_from_nested(&self) -> Receiver<String>`. Cheap clone of
