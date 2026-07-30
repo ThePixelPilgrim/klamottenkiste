@@ -112,6 +112,17 @@ Headless / build-only (no GTK window is opened — a real window would steal foc
   (`widget_to_output` against the **runtime** output size, `requested_output`,
   `gtk_button_to_evdev`).
 
+### Xwayland readiness gate
+
+Two `#[ignore]`d integration tests certify Xwayland support
+(`docs/superpowers/specs/2026-07-30-xwayland-test-harness-design.md`): red
+with a self-explaining message until the feature lands, green when an X11
+client maps, composites, and receives input headlessly. Requires an
+`Xwayland` binary on `PATH` (Fedora: `xorg-x11-server-Xwayland`).
+
+    cargo build -p x11-echo
+    cargo test -p monochromatic-nested-wayland-session --test xwayland -- --ignored --test-threads=1
+
 The lifecycle integration test (`vendor/nested-wayland-session/tests/lifecycle.rs`) asserts,
 headlessly:
 
