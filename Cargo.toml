@@ -1,5 +1,5 @@
 [workspace]
-members = ["klamottenkiste", "vendor/nested-wayland-session"]
+members = ["klamottenkiste", "vendor/nested-wayland-session", "test-clients/x11-echo"]
 resolver = "3"
 
 [workspace.package]
