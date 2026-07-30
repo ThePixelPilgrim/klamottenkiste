@@ -226,6 +226,16 @@ git commit -m "Harness: add x11-echo X11 guinea-pig client"
 
 ### Task 3: The gate — `tests/xwayland.rs` + docs
 
+> **Superseded by final review (2026-07-30):** this task's code listing and
+> commands are the as-planned single-binary version and no longer match the
+> shipped gate. The shipped gate is two single-test binaries (`xwayland.rs` +
+> `xwayland_e2e.rs`), spawns `target/<profile>/x11-echo` directly instead of
+> `cargo run -p x11-echo`, captures client stderr, asserts `mapped`/`exposed`
+> before the magenta poll, uses a snapshot-diff Xwayland reap check, and runs
+> with `--no-fail-fast` and without `--test-threads=1`. See the spec's
+> "Amended after final review" note; this listing is kept as the historical
+> record of what was executed.
+
 **Files:**
 - Create: `vendor/nested-wayland-session/tests/xwayland.rs`
 - Modify: `klamottenkiste/docs/widget.md` (testing section, after the existing test-command documentation around lines 106–113)
