@@ -4,7 +4,8 @@
 //! Connects to `$DISPLAY`, maps one window, fills it `#FF00FF` on every Expose,
 //! and prints one flushed line per observed event so the spawning test can
 //! assert on stdout: `mapped`, `exposed`, `key-press <keycode>`,
-//! `button-press <n>`.
+//! `button-press <n>`. X11 protocol errors go to stderr, keeping stdout
+//! protocol-only.
 
 use std::io::Write;
 
@@ -80,6 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::KeyPress(e) => writeln!(out, "key-press {}", e.detail)?,
             Event::ButtonPress(e) => writeln!(out, "button-press {}", e.detail)?,
+            // Protocol errors go to stderr — stdout stays protocol-only so the
+            // spawning test can parse it strictly, while a red gate can still
+            // quote what actually went wrong.
+            Event::Error(e) => eprintln!("x11 protocol error: {e:?}"),
             _ => {}
         }
         out.flush()?;
