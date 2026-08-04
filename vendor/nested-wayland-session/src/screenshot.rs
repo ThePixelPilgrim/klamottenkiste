@@ -41,8 +41,11 @@ use crate::{
 /// ```
 pub fn capture(state: &mut Compositor, path: &Path) -> Result<()> {
     // What:     Read one upright RGBA frame (bytes, width, height, stride).
-    // Why:      `read_frame_rgba` already flips to upright and reports the format.
-    let (pixels, width, height, stride) = read_frame_rgba(state);
+    // Why:      `read_frame_rgba` already flips to upright and reports the format. A GPU
+    //           failure becomes this command's error — the control socket answers `err ...`
+    //           and the compositor keeps running, rather than unwinding the event loop.
+    let (pixels, width, height, stride) =
+        read_frame_rgba(state).context("rendering the frame to screenshot")?;
 
     // What:     Encode the upright buffer to `path`.
     // Why:      `read_frame_rgba` returns top-down pixels, so no further flip is needed.

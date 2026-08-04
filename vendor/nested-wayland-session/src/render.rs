@@ -14,6 +14,11 @@
 /// ```
 use std::time::Duration;
 
+/// What:     `use anyhow::{Result, anyhow};`. The crate's error alias and its constructor.
+/// Why:      `read_frame_rgba` reports GPU failures to its caller instead of panicking the
+///           compositor thread; every step it takes talks to a driver that may say no.
+use anyhow::{Result, anyhow};
+
 /// What:     Grouped `use` of the render-element type, the GLES renderer, the
 ///           `render_output` helper, and the `Rectangle` geometry type.
 /// Why:      Everything `redraw` references.
@@ -64,10 +69,22 @@ pub const BYTES_PER_PIXEL: usize = 4;
 
 /// Composite the current frame and read it back to CPU memory as upright RGBA8.
 ///
-/// Signature: `read_frame_rgba(state: &mut Compositor) -> (Vec<u8>, u32 /*w*/, u32 /*h*/,
-/// usize /*stride*/)`. Binds the offscreen renderbuffer, composites the space into it with
-/// `render_output` (exactly as `redraw` does), copies the framebuffer to CPU memory via the
-/// renderer's `ExportMem` primitive, and flips the rows so the returned image is upright.
+/// Signature: `read_frame_rgba(state: &mut Compositor) -> Result<(Vec<u8>, u32 /*w*/,
+/// u32 /*h*/, usize /*stride*/)>`. Binds the offscreen renderbuffer, composites the space
+/// into it with `render_output` (exactly as `redraw` does), and copies the framebuffer to CPU
+/// memory via the renderer's `ExportMem` primitive.
+///
+/// FALLIBLE ON PURPOSE. Every step here talks to the GPU, and each one fails for reasons that
+/// are neither bugs nor unrecoverable: an EGL context lost to a GPU reset, a driver that
+/// refuses an `Abgr8888` `ReadPixels`, a target that could not be bound. This function runs on
+/// the compositor thread inside `event_loop.run`, so a panic would unwind out of the event
+/// loop and drop the display and the listening socket with it — one failed screenshot would
+/// kill every hosted client. Callers turn the error into their own failure instead:
+/// [`crate::capture::capture`] into a `CaptureResult`, [`crate::screenshot::capture`] into the
+/// control command's `Result`, and the redraw timer into a dropped frame plus a warning.
+///
+/// It binds `backend.bind_readback()`, NOT `backend.bind()`: a readback composites a frame
+/// nobody presents, so it must not claim a dmabuf pool slot (see `HeadlessBackend::bind_readback`).
 ///
 /// Pixel format: the bytes are RGBA8 (memory order R, G, B, A per pixel), which maps to
 /// `gdk::MemoryFormat::R8g8b8a8`. The readback requests `Fourcc::Abgr8888`; DRM fourccs name
@@ -82,9 +99,9 @@ pub const BYTES_PER_PIXEL: usize = 4;
 ///
 /// MUST be called on the compositor thread, where the GLES context is current (e.g. from the
 /// redraw timer, right after `redraw`). It is the single readback primitive shared by the GTK
-/// presentation path and the `screenshot` control command, so orientation and format handling
-/// live in one place.
-pub fn read_frame_rgba(state: &mut Compositor) -> (Vec<u8>, u32, u32, usize) {
+/// presentation path, the in-process capture, and the `screenshot` control command, so
+/// orientation and format handling live in one place.
+pub fn read_frame_rgba(state: &mut Compositor) -> Result<(Vec<u8>, u32, u32, usize)> {
     // What:     Framebuffer size and unsigned dimensions.
     // Why:      Sets the readback region and the returned image size.
     let size = state.backend.window_size();
@@ -101,10 +118,12 @@ pub fn read_frame_rgba(state: &mut Compositor) -> (Vec<u8>, u32, u32, usize) {
     {
         // What:     Bind the offscreen renderbuffer for drawing + readback.
         // Why:      Need the renderer and target to composite and then read back.
+        //           `bind_readback`, not `bind`: this frame is never presented, so it must not
+        //           take a dmabuf pool slot out of the presentation rotation.
         let (renderer, mut framebuffer) = state
             .backend
-            .bind()
-            .expect("binding the framebuffer for readback failed");
+            .bind_readback()
+            .map_err(|err| anyhow!("binding the framebuffer for readback failed: {err:?}"))?;
 
         // What:     Composite the current committed client content into the framebuffer.
         // Why:      The readback should reflect the latest frame (age 0 forces a full draw).
@@ -119,7 +138,7 @@ pub fn read_frame_rgba(state: &mut Compositor) -> (Vec<u8>, u32, u32, usize) {
             &mut state.damage_tracker,
             CLEAR_COLOR,
         )
-        .expect("rendering the frame for readback failed");
+        .map_err(|err| anyhow!("rendering the frame for readback failed: {err:?}"))?;
 
         // What:     The whole framebuffer in BUFFER coordinates.
         // Why:      `copy_framebuffer` reads a buffer-space region.
@@ -130,13 +149,13 @@ pub fn read_frame_rgba(state: &mut Compositor) -> (Vec<u8>, u32, u32, usize) {
         // Why:      Move GPU pixels somewhere readable.
         let mapping = renderer
             .copy_framebuffer(&framebuffer, region, Fourcc::Abgr8888)
-            .expect("copy_framebuffer failed");
+            .map_err(|err| anyhow!("copying the framebuffer to CPU memory failed: {err:?}"))?;
 
         // What:     A read-only byte slice of the mapping, copied into our owned buffer.
         // Why:      Hand back an owned copy so the renderer borrow can end.
         let pixels = renderer
             .map_texture(&mapping)
-            .expect("mapping the readback texture failed");
+            .map_err(|err| anyhow!("mapping the readback texture failed: {err:?}"))?;
         upright.extend_from_slice(pixels);
     }
 
@@ -147,7 +166,7 @@ pub fn read_frame_rgba(state: &mut Compositor) -> (Vec<u8>, u32, u32, usize) {
     // What:     Return the RGBA bytes plus dimensions and stride, unflipped.
     // Why:      The `Transform::Normal` output composites top-down, so `copy_framebuffer`
     //           already handed back upright rows — callers (GTK texture, PNG) want top-down.
-    (upright, width, height, stride)
+    return Ok((upright, width, height, stride));
 }
 
 /// Composite the hosted window into the nested framebuffer and present one frame.

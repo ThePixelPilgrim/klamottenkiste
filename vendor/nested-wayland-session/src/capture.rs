@@ -104,14 +104,19 @@ pub fn start(loop_handle: &LoopHandle<Compositor>) -> Result<CaptureSender> {
 ///
 /// What:     `pub fn capture(state: &mut Compositor) -> CaptureResult`. Composites a FRESH
 ///           frame via `render::read_frame_rgba` and wraps the upright RGBA8 bytes in a
-///           [`Frame`], rejecting a degenerate readback (no area, or fewer bytes than the
-///           reported geometry needs) with a message.
+///           [`Frame`], reporting a failed render/readback and rejecting a degenerate one (no
+///           area, or fewer bytes than the reported geometry needs) with a message.
 /// Why:      The single place the in-process capture's semantics live; called from the
 ///           channel source and directly usable by any other main-thread caller.
 pub fn capture(state: &mut Compositor) -> CaptureResult {
-    // What:     Read one upright RGBA frame (bytes, width, height, stride).
-    // Why:      The shared readback primitive already handles orientation and pixel format.
-    let (bytes, width, height, stride) = read_frame_rgba(state);
+    // What:     Read one upright RGBA frame (bytes, width, height, stride), turning a GPU
+    //           failure into this capture's error instead of letting it escape.
+    // Why:      The shared readback primitive handles orientation and pixel format, and it is
+    //           fallible for exactly this call site: we run inside the compositor's event-loop
+    //           callback, where an unwind would drop the loop, the display and the Wayland
+    //           socket. A failed capture must cost a capture, not the whole session.
+    let (bytes, width, height, stride) =
+        read_frame_rgba(state).map_err(|err| format!("{err:#}"))?;
 
     // What:     Reject a zero-area output.
     // Why:      A host would build a texture from it and get a GTK critical instead of a

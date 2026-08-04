@@ -242,6 +242,26 @@ impl HeadlessBackend {
         Ok((&mut self.renderer, target))
     }
 
+    /// Bind the offscreen renderbuffer for a CPU readback, claiming no presentation slot.
+    ///
+    /// What:     `pub fn bind_readback(&mut self) -> Result<(&mut GlesRenderer,
+    ///           GlesTarget<'_>), GlesError>`. Binds `self.buffer` — the fallback offscreen
+    ///           renderbuffer, which is allocated and resized in BOTH present modes — and
+    ///           leaves `current`, `next_slot` and the pool's `in_flight` flags untouched.
+    /// Why:      A readback composites a frame nobody presents, so it must not take a
+    ///           presentation slot. Going through `bind` in `dmabuf` mode does two harmful
+    ///           things: it records the slot it picked as `current`, leaving the backend
+    ///           pointing at a target that was drawn into but neither exported nor marked
+    ///           `in_flight` (breaking `current`'s documented invariant, "the pool slot bound
+    ///           by the most recent `bind`, cleared by `export_current`"); and under
+    ///           backpressure — every slot in flight — its round-robin fallback would
+    ///           composite the readback over a slot the host is still sampling, corrupting the
+    ///           frame on screen. Neither can happen on a target outside the pool.
+    pub fn bind_readback(&mut self) -> Result<(&mut GlesRenderer, GlesTarget<'_>), GlesError> {
+        let target = self.renderer.bind(&mut self.buffer)?;
+        return Ok((&mut self.renderer, target));
+    }
+
     /// Finish the GPU work for the just-rendered dmabuf slot and export a description of it.
     ///
     /// What:     `pub fn export_current(&mut self) -> Option<crate::app::DmabufFrame>`. In

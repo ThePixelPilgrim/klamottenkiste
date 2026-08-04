@@ -71,6 +71,11 @@ use crate::{
 /// Why:      `HeadlessHandle` hands a clone of it to the GTK host.
 use crossbeam_channel::Sender;
 
+/// What:     `use tracing::warn;`. The structured warning macro.
+/// Why:      The redraw timer reports a failed readback as a dropped frame instead of
+///           panicking the compositor thread over it.
+use tracing::warn;
+
 /// One composited frame read back to CPU memory, shared across threads.
 ///
 /// What:     `pub struct Frame { pub bytes: Vec<u8>, pub width: u32, pub height: u32,
@@ -170,14 +175,24 @@ pub fn register_redraw_timer(loop_handle: &LoopHandle<'static, Compositor>) {
             //           readback runs on the compositor thread, where the GLES context is
             //           current — the only place `read_frame_rgba` may be called.
             if state.backend.present_mode() == crate::backend::PresentMode::Readback {
-                let (bytes, width, height, stride) = read_frame_rgba(state);
-                if let Ok(mut slot) = state.latest_frame.lock() {
-                    *slot = Some(Frame {
-                        bytes,
-                        width,
-                        height,
-                        stride,
-                    });
+                // What:     Publish a successful readback; on failure keep the frame already
+                //           published and log the drop.
+                // Why:      `read_frame_rgba` is fallible, and a GPU hiccup here must not
+                //           unwind this timer callback: that would tear down the event loop,
+                //           the display and every hosted client over one dropped frame. The
+                //           host keeps presenting the last good frame until the next tick.
+                match read_frame_rgba(state) {
+                    Ok((bytes, width, height, stride)) => {
+                        if let Ok(mut slot) = state.latest_frame.lock() {
+                            *slot = Some(Frame {
+                                bytes,
+                                width,
+                                height,
+                                stride,
+                            });
+                        }
+                    }
+                    Err(err) => warn!("readback present: dropping one frame ({err:#})"),
                 }
             }
 
