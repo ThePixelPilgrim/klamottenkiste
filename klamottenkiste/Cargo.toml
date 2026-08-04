@@ -1,6 +1,6 @@
 [package]
 name = "klamottenkiste"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embed a Wayland application inside a GTK4 widget, via a nested Smithay compositor"
 edition.workspace = true
 license.workspace = true
