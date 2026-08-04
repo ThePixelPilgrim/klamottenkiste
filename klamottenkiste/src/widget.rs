@@ -28,7 +28,7 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::mpsc::{TryRecvError, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk::glib;
 use gtk::prelude::*;
@@ -52,6 +52,15 @@ const MIN_OUT_PX: i32 = 16;
 const MAX_OUT_PX: i32 = 16384;
 /// How often the GTK main context checks whether a requested capture has arrived.
 const CAPTURE_POLL_MS: u64 = 4;
+/// How long a capture may go unanswered before the pane gives up on it.
+///
+/// Not a latency budget — the compositor answers in one render plus readback, single-digit
+/// milliseconds. It is what makes [`WaylandPane::capture_frame`]'s "invoked exactly once"
+/// hold unconditionally: a compositor thread that STALLS (a driver wedged inside
+/// `glReadPixels`, an event loop blocked in another source) never disconnects the reply
+/// channel, so without a deadline the callback would never fire and its 250 Hz poll source
+/// would sit on the GTK main context for the life of the process.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One composited frame of the nested output, read back to CPU memory.
 ///
@@ -59,6 +68,10 @@ const CAPTURE_POLL_MS: u64 = 4;
 /// which is exactly what `gdk::MemoryFormat::R8g8b8a8` expects — an embedder can wrap them in
 /// a `gdk::MemoryTexture` with no conversion and no flip. Produced by
 /// [`WaylandPane::capture_frame`].
+///
+/// `Clone` so one capture can be handed to more than one consumer; `Debug` is written by hand
+/// and prints the geometry only, never the pixels.
+#[derive(Clone)]
 pub struct CapturedFrame {
     /// Upright RGBA8 pixels; at least `height * stride` bytes.
     pub rgba: Vec<u8>,
@@ -70,13 +83,29 @@ pub struct CapturedFrame {
     pub stride: usize,
 }
 
+/// Geometry only. A derived `Debug` would dump megabytes of pixels into a single log line, and
+/// the reason to format a frame at all is to say what shape arrived. Deriving nothing was
+/// worse still: it kept `Result<CapturedFrame, _>` from being `{:?}`-printed or `unwrap_err`'d.
+impl fmt::Debug for CapturedFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapturedFrame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("stride", &self.stride)
+            .field("rgba_len", &self.rgba.len())
+            .finish()
+    }
+}
+
 /// Why a [`WaylandPane::capture_frame`] request produced no frame.
 #[derive(Debug)]
 pub enum CaptureError {
-    /// The pane has no running compositor: startup failed, or `close`/`dispose` already ran.
+    /// No reachable compositor: startup failed, it stopped or crashed on its own, or
+    /// `close`/`dispose` already ran.
     NotRunning,
-    /// The compositor was reached but did not hand back a usable frame — it answered with a
-    /// degenerate readback, or it stopped before answering (the detail says which).
+    /// The compositor was reached but did not hand back a usable frame — its render or
+    /// readback failed, it answered with a degenerate frame, or it stopped or stalled before
+    /// answering (the detail says which).
     RenderFailed(String),
 }
 
@@ -746,11 +775,13 @@ impl WaylandPane {
     /// independent of widget visibility.
     ///
     /// `callback` is invoked exactly once, failures included: [`CaptureError::NotRunning`]
-    /// when the pane has no compositor (startup failed, or `close`/`dispose` already ran), and
-    /// [`CaptureError::RenderFailed`] when the compositor answered with an unusable frame or
-    /// stopped before answering (e.g. the pane was closed while the request was in flight).
-    /// The callback holds no reference to the pane, so it still fires if the pane is dropped
-    /// mid-request.
+    /// when the pane has no reachable compositor (startup failed, it stopped or crashed, or
+    /// `close`/`dispose` already ran), and [`CaptureError::RenderFailed`] when the render or
+    /// readback failed, the compositor answered with an unusable frame, or it stopped or
+    /// stalled before answering (e.g. the pane was closed while the request was in flight).
+    /// "Exactly once" is unconditional: a capture nobody ever answers is given up on after a
+    /// bounded wait rather than left pending forever. The callback holds no reference to the
+    /// pane, so it still fires if the pane is dropped mid-request.
     ///
     /// The pane hands back pixels and nothing else: it does not touch the host clipboard,
     /// write a file, or interpret the frame. What happens to it is the embedder's policy.
@@ -771,7 +802,8 @@ impl WaylandPane {
         let (reply_tx, reply_rx) = sync_channel::<CaptureResult>(1);
 
         // Queue the request. `None` = no compositor at all; `Some(Err(_))` = its event loop is
-        // already gone (a close raced this call). Both mean the same thing to the caller.
+        // already gone (a close raced this call, or the thread died under us). Both mean the
+        // same thing to the caller: there is nothing left to capture from.
         let queued = self
             .imp()
             .handle
@@ -789,13 +821,18 @@ impl WaylandPane {
         // Drain the reply on the main context. A short-interval source rather than a
         // main-context channel: `glib::MainContext::channel` is gone in glib 0.22, and an
         // async channel would mean a new dependency for one hand-off — while this widget
-        // already presents frames off exactly this kind of source. The source is one-shot; it
-        // ends on the reply, so nothing polls once the capture has been delivered.
+        // already presents frames off exactly this kind of source. The source is one-shot and
+        // BOUNDED: it ends on the reply, on a disconnect, or on `CAPTURE_TIMEOUT`, so it can
+        // neither outlive its capture nor poll indefinitely. That self-termination is why no
+        // `SourceId` is stored for `close`/`dispose` to remove: closing the pane drops the
+        // compositor handle, which disconnects the reply channel, which ends this source on
+        // its next tick — a bounded few milliseconds later, with the callback fired.
         //
         // `callback` is `FnOnce` inside an `FnMut` source, so it is taken out of the `Option`
         // the one time it fires. Nothing here holds a reference to the pane, so the callback
         // still fires (with an error) if the pane is dropped while the capture is in flight.
         let mut callback = Some(callback);
+        let deadline = Instant::now() + CAPTURE_TIMEOUT;
         glib::timeout_add_local(Duration::from_millis(CAPTURE_POLL_MS), move || {
             let outcome = match reply_rx.try_recv() {
                 Ok(Ok(frame)) => Ok(CapturedFrame {
@@ -805,8 +842,17 @@ impl WaylandPane {
                     stride: frame.stride,
                 }),
                 Ok(Err(detail)) => Err(CaptureError::RenderFailed(detail)),
-                // Still rendering — come back next tick.
-                Err(TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                // Still rendering — come back next tick, unless we have waited too long. A
+                // STALLED compositor never disconnects the channel, so `Empty` on its own is
+                // not a terminating condition; the deadline is what makes "fires exactly
+                // once" hold and what stops this source polling forever.
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    return glib::ControlFlow::Continue;
+                }
+                Err(TryRecvError::Empty) => Err(CaptureError::RenderFailed(format!(
+                    "the compositor did not answer the capture within {}s",
+                    CAPTURE_TIMEOUT.as_secs()
+                ))),
                 // The reply sender was dropped without an answer: the compositor shut down or
                 // died mid-capture. Report it instead of polling forever.
                 Err(TryRecvError::Disconnected) => Err(CaptureError::RenderFailed(
@@ -820,9 +866,23 @@ impl WaylandPane {
         });
     }
 
-    /// Whether the hosted compositor is still running (not yet closed/disposed).
+    /// Whether the hosted compositor is still running.
+    ///
+    /// `false` when the pane never started one (see [`WaylandPane::startup_error`]), when
+    /// `close`/`dispose` tore it down, **and** when the compositor thread ended on its own —
+    /// its event loop stopped, or it died. That last case is why this asks the thread rather
+    /// than only checking that a handle is held: an embedder gating UI on this (the canonical
+    /// use is a screenshot button's sensitivity) must not keep offering an action over a dead
+    /// pane.
+    ///
+    /// A snapshot, not a lock: the compositor may stop the instant after the call returns, so
+    /// a `true` still has to be paired with handling the failure of whatever it gated.
     pub fn is_running(&self) -> bool {
-        self.imp().handle.borrow().is_some()
+        self.imp()
+            .handle
+            .borrow()
+            .as_ref()
+            .is_some_and(|handle| handle.is_alive())
     }
 
     /// Explicitly tear the compositor and its hosted client down NOW.

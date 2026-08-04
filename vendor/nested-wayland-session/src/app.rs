@@ -396,6 +396,25 @@ impl HeadlessHandle {
         self.input_tx.clone()
     }
 
+    /// Whether the compositor thread is still running.
+    ///
+    /// What:     `pub fn is_alive(&self) -> bool`. Asks the THREAD (`JoinHandle::is_finished`),
+    ///           not merely whether this handle still holds one: `false` once
+    ///           `shutdown`/`join` took it, AND `false` when the thread ended on its own — its
+    ///           event loop stopped, its hosted client's exit stopped it, or it panicked.
+    /// Why:      Holding a `HeadlessHandle` is not the same as having a compositor. A host that
+    ///           keys UI state on "is there a session" (the canonical case is a screenshot
+    ///           button's sensitivity) must see a thread that died under it, or it keeps
+    ///           offering actions that can only fail. This is a SNAPSHOT, not a lock: the
+    ///           thread may exit immediately after the call returns, so a `true` still has to
+    ///           be followed by handling the eventual send/reply failure.
+    pub fn is_alive(&self) -> bool {
+        let Some(thread) = self.thread.as_ref() else {
+            return false;
+        };
+        return !thread.is_finished();
+    }
+
     /// Ask the compositor thread for a freshly rendered frame; the answer arrives on `reply`.
     ///
     /// What:     `pub fn request_frame(&self, reply: mpsc::SyncSender<CaptureResult>) ->
