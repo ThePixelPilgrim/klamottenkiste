@@ -24,6 +24,17 @@ pub mod app;
 /// ```
 pub mod backend;
 
+/// What:     `pub mod capture;`. Declares the in-process frame-capture module.
+/// Why:      Lets an embedding host ask the compositor thread for a freshly rendered frame
+///           as bytes (no PNG, no file) — the control socket's `screenshot <path>` command
+///           writes a file instead, which is pure overhead for an in-process consumer.
+///
+/// In TS you'd write (pseudocode):
+/// ```ts
+/// export * as capture from "./capture";
+/// ```
+pub mod capture;
+
 /// What:     `pub mod child;`. Declares the hosted-client lifecycle module.
 /// Why:      Spawns the app and stops the loop on its exit.
 ///
@@ -152,6 +163,17 @@ pub mod state;
 /// export { run, spawn_headless, HeadlessHandle } from "./app";
 /// ```
 pub use app::{run, spawn_headless, DmabufFrame, DmabufPlane, Frame, HeadlessHandle};
+
+/// What:     `pub use capture::{CaptureRequest, CaptureResult};`. Re-export the capture
+///           request/reply types at the crate root.
+/// Why:      A host driving [`HeadlessHandle::request_frame`] needs the reply type without
+///           knowing the module layout, exactly as it gets `Frame` from here.
+///
+/// In TS you'd write (pseudocode):
+/// ```ts
+/// export { CaptureRequest, CaptureResult } from "./capture";
+/// ```
+pub use capture::{CaptureRequest, CaptureResult};
 
 /// What:     `pub use cli::{parse_args, Config};`. Re-export the parser and its output.
 /// Why:      The binary and tests use these directly from the crate root.

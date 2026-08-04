@@ -57,6 +57,7 @@ static INSTANCE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Why:      Orchestration calls into backend, child, control, render, and state.
 use crate::{
     backend::init_headless_backend,
+    capture::{self, CaptureRequest, CaptureResult, CaptureSender},
     child::{register_exit_poll, spawn_child},
     cli::Config,
     clipboard,
@@ -297,6 +298,8 @@ pub struct HeadlessHandle {
     release_tx: Sender<u64>,
     /// A clone of the real-GTK-input sender: enqueue `SpikeInput` for the seat.
     input_tx: Sender<SpikeInput>,
+    /// Queues one-shot capture requests onto the compositor thread (see `crate::capture`).
+    capture_tx: CaptureSender,
     /// The bound control-socket path (for the `type`/`click`/`screenshot` API), if any.
     control_socket_path: Option<std::path::PathBuf>,
     /// SPIKE SCOPE: text the hosted client copied, waiting to go onto the host clipboard.
@@ -376,6 +379,26 @@ impl HeadlessHandle {
     ///           the compositor loop drains and applies them to the seat.
     pub fn input_sender(&self) -> Sender<SpikeInput> {
         self.input_tx.clone()
+    }
+
+    /// Ask the compositor thread for a freshly rendered frame; the answer arrives on `reply`.
+    ///
+    /// What:     `pub fn request_frame(&self, reply: mpsc::SyncSender<CaptureResult>) ->
+    ///           Result<()>`. Queues a [`CaptureRequest`] onto the compositor's event loop
+    ///           (which the send also wakes) and returns immediately — the caller never blocks
+    ///           on the readback. Exactly one [`CaptureResult`] is sent on `reply`; if the
+    ///           compositor stops before answering, the request (and with it `reply`'s sending
+    ///           half) is dropped, so a waiting receiver sees a disconnect rather than hanging.
+    ///           `Err` means the request was never queued: the event loop is already gone.
+    /// Why:      The in-process alternative to the control socket's `screenshot <path>`: an
+    ///           embedding host gets the composited pixels as bytes, with no file and no PNG
+    ///           round-trip. The frame is rendered FRESH, so this works in both present modes
+    ///           — unlike [`HeadlessHandle::latest_frame`], which stays empty in `dmabuf` mode.
+    pub fn request_frame(&self, reply: mpsc::SyncSender<CaptureResult>) -> Result<()> {
+        return self
+            .capture_tx
+            .send(CaptureRequest { reply })
+            .map_err(|_| anyhow!("the compositor event loop is gone; no frame can be captured"));
     }
 
     /// The path of the bound control socket, if one was started.
@@ -493,6 +516,8 @@ struct Ready {
     release_tx: Sender<u64>,
     /// The sending half of the real-GTK-input queue.
     input_tx: Sender<SpikeInput>,
+    /// The sending half of the one-shot capture-request channel.
+    capture_tx: CaptureSender,
     /// SPIKE SCOPE: text the hosted client copied.
     clipboard_from_nested: crossbeam_channel::Receiver<String>,
     /// SPIKE SCOPE: text observed on the host clipboard.
@@ -574,6 +599,25 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
                 }
             };
 
+            // What:     Register the in-process capture channel on the same event loop and
+            //           keep its sender. Failing to register it is reported like any other
+            //           startup failure, after tearing the control thread back down (it is
+            //           already listening at this point and would otherwise be orphaned).
+            // Why:      An embedding host needs the composited frame as BYTES on demand; the
+            //           control socket only offers `screenshot <path>`, i.e. a file.
+            let capture_tx = {
+                let loop_handle = event_loop.handle();
+                match capture::start(&loop_handle) {
+                    Ok(sender) => sender,
+                    Err(err) => {
+                        control.shutdown();
+                        let _ = ready_tx
+                            .send(Err(anyhow!("starting the capture channel failed: {err:#}")));
+                        return Err(err);
+                    }
+                }
+            };
+
             // What:     Send the advertised socket name, a clone of the shared frame slot,
             //           the input sender, the loop stop signal, and the control handle back
             //           to the caller.
@@ -587,6 +631,7 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
                 latest_dmabuf: Arc::clone(&state.latest_dmabuf),
                 release_tx: state.backend.release_sender(),
                 input_tx: state.input_tx.clone(),
+                capture_tx,
                 // SPIKE SCOPE: the two halves the GTK host needs to bridge clipboards.
                 clipboard_from_nested: state.clipboard.to_host_rx.clone(),
                 clipboard_to_nested: state.clipboard.from_host_tx.clone(),
@@ -624,6 +669,7 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
             latest_dmabuf: ready.latest_dmabuf,
             release_tx: ready.release_tx,
             input_tx: ready.input_tx,
+            capture_tx: ready.capture_tx,
             control_socket_path: Some(control_socket_path),
             clipboard_from_nested: ready.clipboard_from_nested,
             clipboard_to_nested: ready.clipboard_to_nested,
