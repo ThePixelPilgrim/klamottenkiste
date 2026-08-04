@@ -33,6 +33,13 @@ mod widget;
 /// lifetime — and the embedder contract for hiding a pane without killing its browser.
 pub use widget::WaylandPane;
 
+/// The in-process frame capture: pixels out, no policy.
+///
+/// [`WaylandPane::capture_frame`] hands the embedder a [`CapturedFrame`] (upright RGBA8, ready
+/// for `gdk::MemoryTexture`) or a [`CaptureError`]. What happens to those pixels — clipboard,
+/// file, upload — is the embedder's business; this library never decides it.
+pub use widget::{CaptureError, CapturedFrame};
+
 /// Re-export of the vendored nested compositor.
 ///
 /// The widget builds on this internally; it stays public because an embedder still needs the

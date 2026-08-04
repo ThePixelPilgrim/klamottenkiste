@@ -25,13 +25,17 @@
 //!
 //! [Smithay]: https://github.com/Smithay/smithay
 
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::mpsc::{TryRecvError, sync_channel};
+use std::time::Duration;
 
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
 use crossbeam_channel::Sender;
+use nested_wayland_session::CaptureResult;
 use nested_wayland_session::input::SpikeInput;
 
 /// Initial nested output width (device px). Replaced by the first resize-poll sample.
@@ -46,6 +50,46 @@ const RESIZE_POLL_MS: u64 = 150;
 const MIN_OUT_PX: i32 = 16;
 /// Largest nested output edge, in device pixels.
 const MAX_OUT_PX: i32 = 16384;
+/// How often the GTK main context checks whether a requested capture has arrived.
+const CAPTURE_POLL_MS: u64 = 4;
+
+/// One composited frame of the nested output, read back to CPU memory.
+///
+/// The bytes are RGBA8 in memory order (R, G, B, A per pixel) with row 0 at the **top**,
+/// which is exactly what `gdk::MemoryFormat::R8g8b8a8` expects — an embedder can wrap them in
+/// a `gdk::MemoryTexture` with no conversion and no flip. Produced by
+/// [`WaylandPane::capture_frame`].
+pub struct CapturedFrame {
+    /// Upright RGBA8 pixels; at least `height * stride` bytes.
+    pub rgba: Vec<u8>,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Row length in bytes. Currently always `width * 4`, but honour it rather than assume it.
+    pub stride: usize,
+}
+
+/// Why a [`WaylandPane::capture_frame`] request produced no frame.
+#[derive(Debug)]
+pub enum CaptureError {
+    /// The pane has no running compositor: startup failed, or `close`/`dispose` already ran.
+    NotRunning,
+    /// The compositor was reached but did not hand back a usable frame — it answered with a
+    /// degenerate readback, or it stopped before answering (the detail says which).
+    RenderFailed(String),
+}
+
+impl fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRunning => write!(f, "the pane's compositor is not running"),
+            Self::RenderFailed(detail) => write!(f, "capturing a frame failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
 
 /// Invert a `ContentFit::Contain` letterbox: widget-local point → compositor output pixels.
 ///
@@ -687,6 +731,93 @@ impl WaylandPane {
     /// The compositor-startup error message, if `spawn_headless` failed at construction.
     pub fn startup_error(&self) -> Option<String> {
         self.imp().startup_error.borrow().clone()
+    }
+
+    /// Request a freshly rendered frame of the nested output.
+    ///
+    /// The capture is asynchronous. The request crosses to the compositor thread — the only
+    /// place the GLES context is current — which composites and reads back one frame there;
+    /// `callback` is invoked later, on the GTK main context, with the result. The GTK thread
+    /// never blocks on the GPU readback.
+    ///
+    /// The frame is rendered fresh for this call, so it is up to date in **either** present
+    /// mode (it does not read the CPU-readback cache, which stays empty on the dmabuf path),
+    /// and it works while the pane is hidden or unmapped — the offscreen framebuffer is
+    /// independent of widget visibility.
+    ///
+    /// `callback` is invoked exactly once, failures included: [`CaptureError::NotRunning`]
+    /// when the pane has no compositor (startup failed, or `close`/`dispose` already ran), and
+    /// [`CaptureError::RenderFailed`] when the compositor answered with an unusable frame or
+    /// stopped before answering (e.g. the pane was closed while the request was in flight).
+    /// The callback holds no reference to the pane, so it still fires if the pane is dropped
+    /// mid-request.
+    ///
+    /// The pane hands back pixels and nothing else: it does not touch the host clipboard,
+    /// write a file, or interpret the frame. What happens to it is the embedder's policy.
+    ///
+    /// ```no_run
+    /// # use klamottenkiste::WaylandPane;
+    /// # let pane = WaylandPane::new();
+    /// pane.capture_frame(|result| match result {
+    ///     Ok(frame) => println!("{}x{} pixels", frame.width, frame.height),
+    ///     Err(err) => eprintln!("{err}"),
+    /// });
+    /// ```
+    pub fn capture_frame<F>(&self, callback: F)
+    where
+        F: FnOnce(Result<CapturedFrame, CaptureError>) + 'static,
+    {
+        // Bounded one-shot: the compositor thread answers exactly once and never blocks on us.
+        let (reply_tx, reply_rx) = sync_channel::<CaptureResult>(1);
+
+        // Queue the request. `None` = no compositor at all; `Some(Err(_))` = its event loop is
+        // already gone (a close raced this call). Both mean the same thing to the caller.
+        let queued = self
+            .imp()
+            .handle
+            .borrow()
+            .as_ref()
+            .map(|handle| handle.request_frame(reply_tx));
+
+        if !matches!(queued, Some(Ok(()))) {
+            // Report on the main context rather than inline, so the callback's timing does not
+            // depend on WHY the capture failed.
+            glib::idle_add_local_once(move || callback(Err(CaptureError::NotRunning)));
+            return;
+        }
+
+        // Drain the reply on the main context. A short-interval source rather than a
+        // main-context channel: `glib::MainContext::channel` is gone in glib 0.22, and an
+        // async channel would mean a new dependency for one hand-off — while this widget
+        // already presents frames off exactly this kind of source. The source is one-shot; it
+        // ends on the reply, so nothing polls once the capture has been delivered.
+        //
+        // `callback` is `FnOnce` inside an `FnMut` source, so it is taken out of the `Option`
+        // the one time it fires. Nothing here holds a reference to the pane, so the callback
+        // still fires (with an error) if the pane is dropped while the capture is in flight.
+        let mut callback = Some(callback);
+        glib::timeout_add_local(Duration::from_millis(CAPTURE_POLL_MS), move || {
+            let outcome = match reply_rx.try_recv() {
+                Ok(Ok(frame)) => Ok(CapturedFrame {
+                    rgba: frame.bytes,
+                    width: frame.width,
+                    height: frame.height,
+                    stride: frame.stride,
+                }),
+                Ok(Err(detail)) => Err(CaptureError::RenderFailed(detail)),
+                // Still rendering — come back next tick.
+                Err(TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                // The reply sender was dropped without an answer: the compositor shut down or
+                // died mid-capture. Report it instead of polling forever.
+                Err(TryRecvError::Disconnected) => Err(CaptureError::RenderFailed(
+                    "the compositor dropped the capture request".to_string(),
+                )),
+            };
+            if let Some(callback) = callback.take() {
+                callback(outcome);
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     /// Whether the hosted compositor is still running (not yet closed/disposed).
