@@ -8,9 +8,14 @@
 //!   being dropped silently.
 //!
 //! Both phases share one `#[test]`, so GTK is initialised once and only one nested compositor
-//! is brought up. Constructing a `WaylandPane` needs a GTK display: without one (a headless
-//! shell) the test reports that it is skipping rather than failing on the environment, which
-//! matches how the rest of this workspace treats display/GPU-dependent checks.
+//! is brought up.
+//!
+//! REQUIREMENTS: a GTK display AND a usable EGL render node. The pane brings up a real nested
+//! compositor (`backend::init_headless_backend`), so there is no display-only mode. Only the
+//! missing display is treated as "not applicable" and skipped, matching how `gtk::init` is
+//! handled elsewhere in this workspace; a display that is present but cannot bring the
+//! compositor up is a FAILURE, exactly as `spawn_headless` is in the compositor crate's own
+//! tests.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -53,7 +58,9 @@ fn pump_until_filled(slot: &Slot, timeout: Duration) -> Option<Outcome> {
 #[test]
 fn capture_frame_delivers_pixels_and_reports_a_closed_pane() {
     if gtk::init().is_err() {
-        eprintln!("skipping: no GTK display available (this test needs a display, not a GPU)");
+        eprintln!(
+            "skipping: no GTK display available (this test needs a display AND a render node)"
+        );
         return;
     }
 
@@ -95,10 +102,17 @@ fn capture_frame_delivers_pixels_and_reports_a_closed_pane() {
         frame.height,
         frame.stride
     );
-    // The compositor's clear colour is opaque, so a real composite is never all-zero.
+    // No client is ever attached here, so the frame is the compositor's clear colour — which
+    // is OPAQUE. That is the check: every pixel's alpha byte is 0xff, which an untouched
+    // (all-zero) buffer fails and which pins the documented RGBA byte order. Deliberately NOT
+    // "some byte is non-zero": the clear colour is 0.1 grey, so that holds for a frame nothing
+    // was ever composited into and would prove nothing here.
     assert!(
-        frame.rgba.iter().any(|&byte| byte != 0),
-        "the captured buffer is entirely zero — nothing was composited"
+        frame
+            .rgba
+            .chunks_exact(BYTES_PER_PIXEL)
+            .all(|px| px[3] == 0xff),
+        "the captured buffer has transparent pixels — it is not a composited RGBA8 frame"
     );
 
     // ---- (b) CLOSED: the callback still fires, with NotRunning. -------------------------
@@ -113,9 +127,10 @@ fn capture_frame_delivers_pixels_and_reports_a_closed_pane() {
 
     let outcome = pump_until_filled(&slot, CAPTURE_WAIT)
         .expect("the capture callback was dropped silently for a closed pane");
+    // `{outcome:?}` straight through: `CapturedFrame`'s hand-written `Debug` prints geometry
+    // only, so the failure message is readable and no `map` dance is needed to build one.
     assert!(
         matches!(outcome, Err(CaptureError::NotRunning)),
-        "a closed pane must report NotRunning, got {:?}",
-        outcome.map(|frame| (frame.width, frame.height))
+        "a closed pane must report NotRunning, got {outcome:?}"
     );
 }

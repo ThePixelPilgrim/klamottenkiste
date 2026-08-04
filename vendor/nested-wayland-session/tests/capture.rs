@@ -10,8 +10,9 @@
 //!   non-blank while the compositor runs in its DEFAULT present mode (`dmabuf`), where
 //!   `latest_frame()` — the CPU-readback cache — is empty. The pixels can therefore only come
 //!   from the capture's own composite. This is the property the whole feature rests on.
-//! * **(c) AFTER SHUTDOWN** — `request_frame` reports the loop is gone instead of queueing a
-//!   request nobody will ever answer. That is what the widget turns into `NotRunning`.
+//! * **(c) AFTER SHUTDOWN** — `is_alive` flips with the compositor THREAD, and `request_frame`
+//!   reports the loop is gone instead of queueing a request nobody will ever answer. That pair
+//!   is what the widget turns into `is_running() == false` and `NotRunning`.
 //!
 //! Deliberately does NOT set `KLAMOTTENKISTE_PRESENT`: the point is the default (dmabuf) mode.
 //! Everything lives in one `#[test]` so the EGL/headless backend is brought up once, matching
@@ -70,10 +71,18 @@ fn assert_plausible(frame: &Frame, label: &str) {
         frame.height,
         frame.stride
     );
-    // The clear colour is opaque, so a real composite is never an all-zero buffer.
+    // Every pixel carries the clear colour's opaque alpha unless a client drew something at
+    // least as opaque over it, so "fully opaque" is what a real composite looks like and an
+    // untouched buffer (all zero, alpha included) is what it never looks like. Deliberately
+    // NOT "some byte is non-zero": `CLEAR_COLOR` is 0.1 grey, so a BLANK frame is already
+    // non-zero everywhere and that check would pass on a compositor that composited nothing.
+    // Reading the fourth byte also pins the RGBA byte order this whole contract rests on.
     assert!(
-        frame.bytes.iter().any(|&byte| byte != 0),
-        "{label}: the readback is entirely zero — nothing was composited"
+        frame
+            .bytes
+            .chunks_exact(BYTES_PER_PIXEL)
+            .all(|px| px[3] == 0xff),
+        "{label}: the readback has transparent pixels — it is not a composited RGBA8 frame"
     );
 }
 
@@ -111,35 +120,42 @@ fn capture_renders_a_fresh_frame_and_reports_a_stopped_compositor() {
         std::thread::sleep(Duration::from_millis(150));
     }
 
-    // The readback cache: empty in the default dmabuf present mode, which is exactly what
-    // makes the painted capture above proof of a fresh composite. If the compositor fell back
-    // to readback internally (no dmabuf pool on this machine) the cache is populated and this
+    // THE paint must reach A capture, in every present mode — that is the regression section
+    // (b) exists to catch, so it is asserted unconditionally, OUTSIDE the mode check below.
+    // (It used to live in the `None` arm only, which let the whole section pass with zero
+    // assertions on any machine that fell back to readback.)
+    let painted = painted.as_ref().expect(
+        "no painted capture within PAINT_WAIT (client never drew, or the capture is reading a \
+         stale cache)",
+    );
+    assert_plausible(painted, "painted capture");
+
+    // Only the INFERENCE is mode-dependent. The readback cache is empty in the default dmabuf
+    // present mode, which is what makes the painted capture above proof of a FRESH composite:
+    // there was no cache the pixels could have come from. If the compositor fell back to
+    // readback internally (no dmabuf pool on this machine) the cache is populated and that
     // particular inference is unavailable — the capture is a fresh render either way, so say
     // so and move on rather than failing on an environment difference.
-    match handle.latest_frame() {
-        None => {
-            let frame = painted.as_ref().expect(
-                "no painted capture within PAINT_WAIT (client never drew, or the capture is \
-                 reading a stale cache)",
-            );
-            assert_plausible(frame, "painted capture");
-        }
-        Some(_) => {
-            eprintln!(
-                "note: the compositor fell back to the readback present mode, so the \
-                 cache-independence half of this test is not observable here"
-            );
-            if let Some(frame) = painted.as_ref() {
-                assert_plausible(frame, "painted capture");
-            }
-        }
+    if handle.latest_frame().is_some() {
+        eprintln!(
+            "note: the compositor fell back to the readback present mode, so the \
+             cache-independence half of this test is not observable here"
+        );
     }
 
     let _ = client.kill();
     let _ = client.wait();
 
     // ---- (c) AFTER SHUTDOWN: the request is refused, not silently queued. ---------------
+    assert!(
+        handle.is_alive(),
+        "a compositor that just answered captures must report itself alive"
+    );
     handle.shutdown();
+    assert!(
+        !handle.is_alive(),
+        "is_alive must follow the compositor THREAD, not just whether a handle is held"
+    );
     let after = capture_blocking(&handle, CAPTURE_WAIT);
     assert!(
         after.is_err(),
