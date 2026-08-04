@@ -11,6 +11,12 @@ Each instance also exposes a control channel — `screenshot`, `click`, `key`, `
 that reaches **only** the hosted client, never the host seat. That makes it a way to drive
 embedded GUI applications programmatically without synthesising global input.
 
+A pane can also hand its current frame straight back to the embedder: `WaylandPane::capture_frame`
+renders a fresh frame on the compositor thread and calls back on the GTK main context with upright
+RGBA8 pixels (ready for `gdk::MemoryTexture`) — no temp file, no PNG round-trip. The library
+returns pixels and nothing else; putting them on a clipboard, in a texture or in a file is the
+embedder's policy.
+
 ## Status: early, but the hard part works
 
 The embedding pipeline is proven end-to-end against real Chromium:
