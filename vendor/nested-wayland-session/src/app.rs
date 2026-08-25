@@ -15,8 +15,8 @@ use smithay::{
     backend::renderer::ImportMemWl,
     reexports::{
         calloop::{
-            timer::{TimeoutAction, Timer},
             EventLoop, LoopHandle, LoopSignal,
+            timer::{TimeoutAction, Timer},
         },
         wayland_server::Display,
     },
@@ -24,7 +24,7 @@ use smithay::{
 
 /// What:     `use anyhow::{anyhow, Context, Result};`. Error helpers.
 /// Why:      `run`/`spawn_headless` return `Result` and annotate setup failures.
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 /// What:     `use std::{sync::{mpsc, Arc, Mutex}, thread, time::Duration};`. Std blocks.
 /// Why:      `spawn_headless` runs the loop on a thread and hands the socket name +
@@ -32,8 +32,9 @@ use anyhow::{anyhow, Context, Result};
 ///           `Duration` and the latest readback is published behind `Arc<Mutex<_>>`.
 use std::{
     sync::{
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc,
     },
     thread,
     time::Duration,
@@ -62,7 +63,7 @@ use crate::{
     cli::Config,
     clipboard,
     control::{self, ControlHandle},
-    input::{drain_input, SpikeInput},
+    input::{SpikeInput, drain_input},
     render::{read_frame_rgba, redraw},
     state::Compositor,
 };
@@ -351,16 +352,25 @@ impl HeadlessHandle {
 
     /// Take a snapshot of the most recently composited dmabuf-backed target, if any.
     ///
-    /// What:     `pub fn latest_dmabuf(&self) -> Option<DmabufFrame>`. Clones out the plain
+    /// What:     `pub fn latest_dmabuf(&self) -> Option<DmabufFrame>`. TAKES the published
     ///           `DmabufFrame` (fds are borrowed — the compositor keeps the underlying
-    ///           `Dmabuf` alive until the matching slot is released). `None` before the
-    ///           first dmabuf frame, or when the compositor is in `readback` present mode.
+    ///           `Dmabuf` alive until the matching slot is released), leaving the slot empty
+    ///           until the next composited frame. `None` before the first dmabuf frame, once
+    ///           the current one has been taken, after a resize dropped it, or when the
+    ///           compositor is in `readback` present mode.
     /// Why:      The GTK host imports this as a `GdkDmabufTexture` (zero-copy) instead of the
     ///           CPU readback `latest_frame` does. After sampling, the host MUST call
     ///           [`HeadlessHandle::release_dmabuf`] with `frame.buffer_id` so the slot can be
-    ///           reused; until then the render loop will not overwrite it.
+    ///           reused; until then the render loop will not overwrite it. Handing the frame
+    ///           OUT rather than cloning it makes that a one-to-one hand-off: a host polling
+    ///           faster than the compositor renders cannot import — and then release — the
+    ///           same slot twice, which would free a target still on screen. A host that polls
+    ///           slower simply keeps presenting what it already imported.
     pub fn latest_dmabuf(&self) -> Option<DmabufFrame> {
-        self.latest_dmabuf.lock().ok().and_then(|slot| slot.clone())
+        self.latest_dmabuf
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     /// Signal that a dmabuf pool slot has been fully sampled and may be reused.
@@ -610,7 +620,8 @@ pub fn spawn_headless(width: u32, height: u32) -> Result<HeadlessHandle> {
                 Err(err) => {
                     // What:     Report the startup failure to the caller and stop.
                     // Why:      `spawn_headless` must not hang if the backend fails.
-                    let _ = ready_tx.send(Err(anyhow!("headless compositor startup failed: {err:#}")));
+                    let _ =
+                        ready_tx.send(Err(anyhow!("headless compositor startup failed: {err:#}")));
                     return Err(err);
                 }
             };

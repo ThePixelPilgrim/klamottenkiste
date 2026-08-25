@@ -30,7 +30,7 @@ use anyhow::{Result, anyhow};
 use smithay::{
     backend::{
         allocator::Fourcc,
-        renderer::{element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer, ExportMem},
+        renderer::{ExportMem, element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer},
     },
     desktop::space::render_output,
     utils::{Buffer, Rectangle},
@@ -247,7 +247,17 @@ pub fn redraw(state: &mut Compositor) {
     //           composited with `render_output` (toplevel + ALL popups), with no glReadPixels.
     if let Some(frame) = state.backend.export_current() {
         if let Ok(mut slot) = state.latest_dmabuf.lock() {
-            *slot = Some(frame);
+            // What:     Release the previously published frame if the host never took it.
+            // Why:      `export_current` marks a slot in flight, and only a release ever clears
+            //           that. A frame overwritten here is one no consumer will ever release, so
+            //           without this its slot would stay in flight forever — the pool would
+            //           shrink to nothing (falling back to reusing slots the host is sampling)
+            //           and every resize would retire a generation that can never be freed.
+            //           The publish/take hand-off is strict, so a frame still sitting here is
+            //           provably untaken.
+            if let Some(previous) = slot.replace(frame) {
+                let _ = state.backend.release_sender().send(previous.buffer_id);
+            }
         }
     }
 

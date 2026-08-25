@@ -213,7 +213,7 @@ pub fn send_key(state: &mut Compositor, evdev: u32, key_state: KeyState) {
 /// Why:      The GTK controllers cannot touch the seat directly (it lives on the
 ///           compositor thread), so each event is queued and applied inside the loop via
 ///           the same `input.rs` seat-synthesis path the control socket uses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SpikeInput {
     /// Pointer moved to an output-pixel position (no button).
     Motion {
@@ -434,22 +434,198 @@ pub fn apply(state: &mut Compositor, event: SpikeInput) {
         }
         SpikeInput::Text(text) => type_text(state, &text),
         SpikeInput::Focus(on) => set_keyboard_focus(state, on),
-        SpikeInput::Resize { width, height } => {
-            crate::control::resize_output(state, width, height)
-        }
+        SpikeInput::Resize { width, height } => crate::control::resize_output(state, width, height),
     }
+}
+
+/// Collapse each RUN of adjacent `Resize` events in a batch down to its last one, in place.
+///
+/// What:     `fn coalesce_resizes(events: Vec<SpikeInput>) -> Vec<SpikeInput>`. Every
+///           non-`Resize` event is kept, untouched and in its original order. A `Resize`
+///           is dropped only when the event immediately after it is also a `Resize` — so
+///           within every maximal run of consecutive `Resize` events exactly the last
+///           survives, at its original position, and a `Resize` that has any other event
+///           after it before the next `Resize` is never dropped.
+/// Why:      A burst of GTK resize notifications queued in one event-loop tick is pure
+///           redundancy — only the final size of the burst matters, so replaying every
+///           intermediate `resize_output` call is wasted work, and such storms ARE runs of
+///           adjacent resizes. But `Motion`/`Button` coordinates in the SAME batch were
+///           computed by the GTK host against the pane allocation that was current when
+///           each event was enqueued, so every event must still be applied under the size
+///           that was in effect when it was produced. Dropping only resizes that another
+///           resize immediately supersedes guarantees exactly that: no surviving event
+///           ever moves across a size change. Collapsing non-adjacent resizes instead
+///           (keeping only the batch's last) would run a sandwiched `Motion` against the
+///           PRE-resize size — coordinates that can land outside the old surface, turning
+///           into a pointer leave and losing the click that follows.
+fn coalesce_resizes(events: Vec<SpikeInput>) -> Vec<SpikeInput> {
+    // What:     Push every event in order, but pop the one just pushed first when both it
+    //           and the incoming event are `Resize`.
+    // Why:      Exactly the "collapse each consecutive run to its last" rule above, in one
+    //           pass, by ownership (no clones) and without moving any surviving event.
+    let mut kept: Vec<SpikeInput> = Vec::with_capacity(events.len());
+    for event in events {
+        if matches!(event, SpikeInput::Resize { .. })
+            && matches!(kept.last(), Some(SpikeInput::Resize { .. }))
+        {
+            kept.pop();
+        }
+        kept.push(event);
+    }
+    kept
 }
 
 /// Drain every pending `SpikeInput` from the state's channel and apply it.
 ///
 /// What:     `pub fn drain_input(state: &mut Compositor)`. Clones the receiver (crossbeam
 ///           receivers are cheap to clone) so no borrow of `state` is held across the
-///           `apply` calls, then applies each queued event non-blockingly.
+///           `apply` calls. Drains the whole batch into a `Vec` first, coalesces
+///           redundant `Resize` events out of it, then applies the survivors in order.
 /// Why:      Called once per event-loop iteration (from the post-dispatch callback) to
-///           flush GTK input into the seat with sub-frame latency.
+///           flush GTK input into the seat with sub-frame latency. Draining to a `Vec`
+///           first (instead of applying each event as it's received) is what lets
+///           `coalesce_resizes` see the whole batch and drop the resizes an adjacent
+///           later resize immediately supersedes.
 pub fn drain_input(state: &mut Compositor) {
     let receiver = state.input_rx.clone();
+    let mut events = Vec::new();
     while let Ok(event) = receiver.try_recv() {
+        events.push(event);
+    }
+    for event in coalesce_resizes(events) {
         apply(state, event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_only_the_last_resize() {
+        let events = vec![
+            SpikeInput::Resize {
+                width: 100,
+                height: 100,
+            },
+            SpikeInput::Resize {
+                width: 200,
+                height: 200,
+            },
+            SpikeInput::Resize {
+                width: 300,
+                height: 300,
+            },
+        ];
+
+        let result = coalesce_resizes(events);
+
+        assert_eq!(
+            result,
+            vec![SpikeInput::Resize {
+                width: 300,
+                height: 300,
+            }]
+        );
+    }
+
+    #[test]
+    fn non_resize_events_pass_through_unchanged_and_in_order() {
+        let events = vec![
+            SpikeInput::Motion { x: 1.0, y: 2.0 },
+            SpikeInput::Focus(true),
+            SpikeInput::Key {
+                evdev: 30,
+                pressed: true,
+            },
+        ];
+
+        let result = coalesce_resizes(events.clone());
+
+        assert_eq!(result, events);
+    }
+
+    #[test]
+    fn a_resize_with_an_event_after_it_is_never_dropped() {
+        // Sandwiched: the `Motion` was produced under the 100x100 allocation, so the
+        // 100x100 resize must survive and stay ahead of it.
+        let events = vec![
+            SpikeInput::Motion { x: 1.0, y: 1.0 },
+            SpikeInput::Resize {
+                width: 100,
+                height: 100,
+            },
+            SpikeInput::Motion { x: 2.0, y: 2.0 },
+            SpikeInput::Resize {
+                width: 200,
+                height: 200,
+            },
+            SpikeInput::Motion { x: 3.0, y: 3.0 },
+        ];
+
+        let result = coalesce_resizes(events.clone());
+
+        assert_eq!(result, events);
+    }
+
+    #[test]
+    fn each_run_of_adjacent_resizes_collapses_to_its_last() {
+        let events = vec![
+            SpikeInput::Resize {
+                width: 100,
+                height: 100,
+            },
+            SpikeInput::Resize {
+                width: 200,
+                height: 200,
+            },
+            SpikeInput::Motion { x: 1.0, y: 1.0 },
+            SpikeInput::Resize {
+                width: 300,
+                height: 300,
+            },
+            SpikeInput::Resize {
+                width: 400,
+                height: 400,
+            },
+        ];
+
+        let result = coalesce_resizes(events);
+
+        assert_eq!(
+            result,
+            vec![
+                SpikeInput::Resize {
+                    width: 200,
+                    height: 200,
+                },
+                SpikeInput::Motion { x: 1.0, y: 1.0 },
+                SpikeInput::Resize {
+                    width: 400,
+                    height: 400,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_resize_events_leaves_batch_untouched() {
+        let events = vec![
+            SpikeInput::Motion { x: 1.0, y: 1.0 },
+            SpikeInput::Scroll { dx: 0.0, dy: 1.0 },
+        ];
+
+        let result = coalesce_resizes(events.clone());
+
+        assert_eq!(result, events);
+    }
+
+    #[test]
+    fn empty_batch_stays_empty() {
+        let events: Vec<SpikeInput> = Vec::new();
+
+        let result = coalesce_resizes(events);
+
+        assert_eq!(result, Vec::new());
     }
 }

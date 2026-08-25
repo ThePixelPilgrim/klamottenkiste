@@ -300,7 +300,9 @@ fn handle_connection(stream: UnixStream, sender: &Sender<ControlRequest>) -> Res
         writer
             .write_all(text.as_bytes())
             .context("writing a control response")?;
-        writer.write_all(b"\n").context("writing a control newline")?;
+        writer
+            .write_all(b"\n")
+            .context("writing a control newline")?;
         writer.flush().context("flushing a control response")?;
     }
 
@@ -435,8 +437,9 @@ pub fn execute(state: &mut Compositor, command: Command) -> Response {
 /// Resize the nested output (and its offscreen framebuffer).
 ///
 /// What:     `pub fn resize_output(state: &mut Compositor, width: i32, height: i32)`.
-///           Updates the output mode, rebuilds the damage tracker, reallocates the headless
-///           renderbuffer, and reconfigures the hosted window to the new fullscreen size.
+///           Reallocates the headless renderbuffer, then updates the output mode, rebuilds
+///           the damage tracker, and reconfigures the hosted window to the new fullscreen
+///           size.
 /// Why:      A control command should be able to change the screen size mid-test, and an
 ///           embedding host (the GTK spike) must drive the nested resolution from its pane
 ///           allocation so the hosted app RE-FLOWS rather than being scaled. Both reach
@@ -445,26 +448,104 @@ pub fn execute(state: &mut Compositor, command: Command) -> Response {
 ///           headless backend has no window to ask, so this applies the change directly
 ///           (the winit path relied on a `WinitEvent::Resized` follow-up instead).
 ///
-/// Callers must pass a sane, positive size; a non-positive or absurd size would make the
-/// renderbuffer allocation fail (logged, then the output and the framebuffer disagree).
+/// A resize to a size BOTH the output mode and the backend framebuffer already have returns
+/// immediately, doing none of the above — including the `reconfigure_maximized` at the end. A
+/// control-socket `resize` to the size already in effect is therefore a no-op rather than a way
+/// to re-send a configure to the hosted window; that idempotence is the point of the guard (a
+/// host that re-sends its allocation every frame must not churn the pool), and any caller that
+/// really wants a fresh configure must ask for one directly.
+///
+/// Callers must pass a sane, positive size; a non-positive or absurd size makes the
+/// renderbuffer allocation fail, which is logged and abandons the resize with the output, the
+/// damage tracker and the framebuffer all still agreeing at the previous size.
 pub fn resize_output(state: &mut Compositor, width: i32, height: i32) {
+    // What:     Return at once when the output mode AND the backend framebuffer are BOTH
+    //           already at exactly this size.
+    // Why:      A host that re-sends its allocation on every frame would otherwise rebuild the
+    //           damage tracker, reallocate the dmabuf pool (retiring a generation), drop the
+    //           published frame and re-configure the client — per tick, for no change at all.
+    //           Both halves must match, though. Guarding on the output mode alone makes the
+    //           guard itself the trap whenever the two ever disagree — the output mode says
+    //           NEW, the framebuffer is still OLD, and every retry of that same size returns
+    //           here, so nothing ever reallocates and rendering keeps targeting a framebuffer
+    //           the damage tracker does not match. Requiring both means such a state always
+    //           heals on the next request; re-running the half that already matches is cheap —
+    //           the backend has its own same-size guard and the output change is a no-op
+    //           state commit.
+    let backend_size = state.backend.window_size();
+    if backend_size.w == width
+        && backend_size.h == height
+        && state
+            .output
+            .current_mode()
+            .is_some_and(|current| current.size.w == width && current.size.h == height)
+    {
+        return;
+    }
+
+    // What:     Hand the published-but-untaken dmabuf frame's slot back BEFORE the pool is
+    //           reallocated, in both present modes. A poisoned lock is ignored: nothing else
+    //           can recover it here.
+    // Why:      `latest_dmabuf` describes a pool slot of the generation the resize is about to
+    //           supersede; a host that pumps between the resize and the next redraw would
+    //           import fds of a buffer it has no release id for at the current generation. The
+    //           frame must be TAKEN and its `buffer_id` released, not dropped: `DmabufFrame`
+    //           has no `Drop`, and `export_current` marked the slot in flight, so silently
+    //           clearing the slot would pin it forever — every such resize would retire a
+    //           generation that can never be freed, and the `RETIRED_GENERATION_LIMIT` FIFO
+    //           would then evict generations the host really is still displaying. Releasing
+    //           first means `resize`'s own `drain_releases` sees the id at the CURRENT
+    //           generation and frees the live slot, so it is not even retired; and if the
+    //           reallocation fails the pool is not replaced, so the same release still frees
+    //           the still-live slot.
+    let published = state
+        .latest_dmabuf
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(frame) = published {
+        let _ = state.backend.release_sender().send(frame.buffer_id);
+    }
+
+    // What:     Reallocate the offscreen renderbuffer at the new size FIRST, and give up on
+    //           the whole resize if that fails.
+    // Why:      Rendering targets a buffer that matches the output resolution. The backend
+    //           allocates everything before committing anything, so a failure leaves it whole
+    //           at the OLD size; returning here leaves the output mode and the damage tracker
+    //           at that same old size, so the compositor stays self-consistent and the next
+    //           identical resize request (the host re-sends its allocation) retries the
+    //           allocation instead of being swallowed by the guard above. Committing the mode
+    //           first instead would render a new-sized damage tracker against an old-sized
+    //           framebuffer.
+    if let Err(err) = state.backend.resize(width, height) {
+        warn!("headless resize to {width}x{height} failed: {err:#}");
+        return;
+    }
+
     // What:     Build and apply the new output mode.
     // Why:      Advertise the new resolution to the client.
     let mode = Mode {
         size: (width, height).into(),
         refresh: OUTPUT_REFRESH_MHZ,
     };
-    state.output.change_current_state(Some(mode), None, None, None);
+    state
+        .output
+        .change_current_state(Some(mode), None, None, None);
     state.output.set_preferred(mode);
 
     // What:     Replace the damage tracker with one sized to the new output.
     // Why:      The old tracker's dimensions no longer match the framebuffer.
     state.damage_tracker = OutputDamageTracker::from_output(&state.output);
 
-    // What:     Reallocate the offscreen renderbuffer at the new size.
-    // Why:      Rendering targets a buffer that matches the output resolution.
-    if let Err(err) = state.backend.resize(width, height) {
-        warn!("headless resize to {width}x{height} failed: {err:#}");
+    // What:     Drop the published readback frame describing the pre-resize target. A poisoned
+    //           lock is ignored: nothing else can recover it here.
+    // Why:      A `Frame` is a plain CPU pixel buffer — it owns no pool slot and needs no
+    //           release, so plain clearing is correct here (unlike `latest_dmabuf`, taken and
+    //           released above). It is merely stale pixels at the old size, but publishing them
+    //           after a resize makes the pane flicker back to the old resolution for a tick.
+    //           The host keeps presenting whatever it already imported until the next frame.
+    if let Ok(mut slot) = state.latest_frame.lock() {
+        *slot = None;
     }
 
     // What:     Reconfigure the hosted window to fill the resized screen.

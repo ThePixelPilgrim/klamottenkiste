@@ -184,6 +184,31 @@ fn requested_output(widget_w: i32, widget_h: i32, scale_factor: i32) -> Option<(
     Some((width as i32, height as i32))
 }
 
+/// Trailing-edge debounce decision for one resize-poll tick.
+///
+/// `sample` is this tick's `(width, height, scale)`; `applied` is the last size actually sent
+/// to the compositor; `pending` is the size remembered from the *previous* tick as "seen but
+/// not yet stable" (`None` if the previous tick matched `applied`). Returns the new `pending`
+/// to store, and `Some(size)` only when `sample` is unchanged from `applied` but matches
+/// `pending` — i.e. the size held still across two consecutive polls in a row — so a resize
+/// is sent only once the drag pauses or releases, never on every intermediate sample. Pure and
+/// side-effect-free; the caller updates `applied`/`out_size` and sends only when this returns
+/// `Some`.
+fn debounce_tick(
+    sample: (i32, i32, i32),
+    applied: (i32, i32, i32),
+    pending: Option<(i32, i32, i32)>,
+) -> (Option<(i32, i32, i32)>, Option<(i32, i32, i32)>) {
+    if sample == applied {
+        return (None, None);
+    }
+    if pending == Some(sample) {
+        (None, Some(sample))
+    } else {
+        (Some(sample), None)
+    }
+}
+
 mod imp {
     use super::*;
 
@@ -192,7 +217,7 @@ mod imp {
     use std::time::Duration;
 
     use gtk::gdk;
-    use nested_wayland_session::{spawn_headless, DmabufFrame, HeadlessHandle};
+    use nested_wayland_session::{DmabufFrame, HeadlessHandle, spawn_headless};
 
     /// Whether the widget should prefer the zero-copy dmabuf present path.
     ///
@@ -282,6 +307,9 @@ mod imp {
         pub(super) out_size: Cell<(f64, f64)>,
         /// Last (logical w, logical h, scale) pushed to the compositor by the resize poll.
         pub(super) applied: Cell<(i32, i32, i32)>,
+        /// A newer size seen but not yet stable across two consecutive polls (trailing-edge
+        /// debounce state for the resize poll); `None` when nothing is awaiting confirmation.
+        pub(super) pending_resize: Cell<Option<(i32, i32, i32)>>,
         /// The frame-pump timeout — a VIEW concern, live only while mapped.
         pub(super) pump_source: RefCell<Option<glib::SourceId>>,
         /// The resize-poll timeout — a VIEW concern, live only while mapped.
@@ -306,6 +334,7 @@ mod imp {
                 dmabuf_warned: Cell::new(false),
                 out_size: Cell::new((INIT_OUT_W as f64, INIT_OUT_H as f64)),
                 applied: Cell::new((0, 0, 0)),
+                pending_resize: Cell::new(None),
                 pump_source: RefCell::new(None),
                 resize_source: RefCell::new(None),
                 startup_error: RefCell::new(None),
@@ -382,6 +411,11 @@ mod imp {
             self.stop_pump();
             self.stop_resize_poll();
 
+            // Drop any imported dmabuf texture BEFORE the compositor goes away: the
+            // texture still references the plane fds the shutdown closes, and GTK must be
+            // done with them first. Same order as `unmap`.
+            self.picture.set_paintable(gdk::Paintable::NONE);
+
             // Object teardown (object lifecycle): destroy the compositor + hosted client.
             // This is the ONLY place (besides `close`) the compositor is torn down.
             if let Some(mut handle) = self.handle.borrow_mut().take() {
@@ -389,9 +423,6 @@ mod imp {
             }
             *self.input_tx.borrow_mut() = None;
             *self.release_tx.borrow_mut() = None;
-
-            // Drop any imported dmabuf texture so no pool slot outlives the compositor.
-            self.picture.set_paintable(gdk::Paintable::NONE);
 
             // Unparent the child so GTK does not warn about a still-parented widget.
             self.picture.unparent();
@@ -618,7 +649,11 @@ mod imp {
         /// it only ever uses the CPU `MemoryTexture` path. Runs on the GTK main thread.
         fn pump_tick(&self, obj: &super::WaylandPane) {
             if self.present_dmabuf.get() {
-                let frame = self.handle.borrow().as_ref().and_then(|h| h.latest_dmabuf());
+                let frame = self
+                    .handle
+                    .borrow()
+                    .as_ref()
+                    .and_then(|h| h.latest_dmabuf());
                 if let Some(frame) = frame {
                     if let Some(release_tx) = self.release_tx.borrow().clone() {
                         match build_dmabuf_texture(&frame, &obj.display(), release_tx) {
@@ -687,17 +722,19 @@ mod imp {
                     move || {
                         let imp = obj.imp();
                         let sample = (obj.width(), obj.height(), obj.scale_factor());
-                        if sample == imp.applied.get() {
+                        let (new_pending, to_send) =
+                            debounce_tick(sample, imp.applied.get(), imp.pending_resize.get());
+                        imp.pending_resize.set(new_pending);
+                        let Some(stable) = to_send else {
                             return glib::ControlFlow::Continue;
-                        }
-                        let Some((width, height)) =
-                            requested_output(sample.0, sample.1, sample.2)
+                        };
+                        let Some((width, height)) = requested_output(stable.0, stable.1, stable.2)
                         else {
                             return glib::ControlFlow::Continue;
                         };
                         // Record BEFORE sending: the coordinate mapping and the next
                         // comparison must describe what we asked for.
-                        imp.applied.set(sample);
+                        imp.applied.set(stable);
                         imp.out_size.set((width as f64, height as f64));
                         if let Some(tx) = imp.input_tx.borrow().as_ref() {
                             let _ = tx.send(SpikeInput::Resize { width, height });
@@ -714,6 +751,9 @@ mod imp {
             if let Some(id) = self.resize_source.borrow_mut().take() {
                 id.remove();
             }
+            // Drop any not-yet-stable size: a poll restarted later (e.g. after unmap/map)
+            // starts a fresh debounce window rather than firing on stale mid-drag state.
+            self.pending_resize.set(None);
         }
     }
 }
@@ -894,13 +934,15 @@ impl WaylandPane {
         let imp = self.imp();
         imp.stop_pump();
         imp.stop_resize_poll();
+        // Drop any imported dmabuf texture BEFORE the compositor goes away: the texture
+        // still references the plane fds the shutdown closes, and GTK must be done with
+        // them first. Same order as `unmap` and `dispose`.
+        imp.picture.set_paintable(gtk::gdk::Paintable::NONE);
         if let Some(mut handle) = imp.handle.borrow_mut().take() {
             handle.shutdown();
         }
         *imp.input_tx.borrow_mut() = None;
         *imp.release_tx.borrow_mut() = None;
-        // Drop any imported dmabuf texture so no pool slot outlives the compositor.
-        imp.picture.set_paintable(gtk::gdk::Paintable::NONE);
     }
 }
 
@@ -961,6 +1003,45 @@ mod tests {
         assert_eq!(
             requested_output(i32::MAX, i32::MAX, 8),
             Some((MAX_OUT_PX, MAX_OUT_PX))
+        );
+    }
+
+    #[test]
+    fn debounce_holds_a_single_new_sample_then_sends_on_repeat() {
+        let applied = (900, 300, 1);
+        // First tick at a new size: nothing sent yet, size is remembered as pending.
+        let (pending, sent) = debounce_tick((901, 300, 1), applied, None);
+        assert_eq!(pending, Some((901, 300, 1)));
+        assert_eq!(sent, None);
+        // Same new size seen again next tick: now it sends, and pending clears.
+        let (pending, sent) = debounce_tick((901, 300, 1), applied, pending);
+        assert_eq!(pending, None);
+        assert_eq!(sent, Some((901, 300, 1)));
+    }
+
+    #[test]
+    fn debounce_restarts_the_window_on_a_moving_target() {
+        let applied = (900, 300, 1);
+        // A drag in progress: every tick differs from the last, so nothing is ever sent.
+        let (pending, sent) = debounce_tick((905, 300, 1), applied, None);
+        assert_eq!(sent, None);
+        let (pending, sent) = debounce_tick((910, 300, 1), applied, pending);
+        assert_eq!(
+            pending,
+            Some((910, 300, 1)),
+            "moving target restarts the window"
+        );
+        assert_eq!(sent, None);
+    }
+
+    #[test]
+    fn debounce_is_a_noop_once_matching_applied() {
+        let applied = (900, 300, 1);
+        // Sample already equals what was last sent: no pending, nothing to send, regardless
+        // of stale pending state left over from before the poll caught up.
+        assert_eq!(
+            debounce_tick(applied, applied, Some((901, 300, 1))),
+            (None, None)
         );
     }
 
