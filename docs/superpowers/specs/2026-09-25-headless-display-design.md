@@ -38,6 +38,23 @@ A network viewer stream is spec 2 and plugs in later as one more consumer.
   - Xwayland is a stub (`x11_display()` returns `None`).
   - xkb data is missing on minimal hosts.
 
+## Method: red-green TDD (mandatory)
+
+Every change made under this spec, to code or to the build, is done
+red-green:
+1. **Red:** write the test first, run it, and see it fail for the expected
+   reason.
+2. **Green:** write the minimum that makes it pass, and run it again.
+3. Refactor only while green.
+
+- No implementation is written before its failing test exists, and red and
+  green each land as a commit or are shown in the task's record, so the order
+  is checkable.
+- A bug fix starts with a test that reproduces the bug.
+- Where a test is already red (the Xwayland harness in Section 2), that
+  harness is the red step and is not edited to turn green.
+- The implementation plans for this spec carry this rule into every task.
+
 ## 1. Architecture and process model (approved)
 
 - **Binary:** `klamottenkiste-display`, built from the klamottenkiste repo on
